@@ -415,7 +415,7 @@ The goal is to judge profile presentation, not the person.
 Score these categories from 0.0 to 10.0:
 
 1. avatar
-2. username
+2. nickname
 3. bio
 4. coherence
 5. vibe
@@ -909,7 +909,7 @@ def get_font(
 
 def make_avatar(
     data,
-    size=250
+    size=300
 ):
 
     result = Image.new(
@@ -1143,7 +1143,7 @@ def create_card(
         W // 2,
         35,
         get_font(
-            52,
+            100,
             True
         ),
         WHITE
@@ -1154,7 +1154,7 @@ def create_card(
         W // 2,
         100,
         get_font(
-            22,
+            50,
             True
         ),
         MUTED
