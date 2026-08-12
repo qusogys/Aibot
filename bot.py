@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import io
 import json
 import logging
@@ -31,36 +32,17 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2
-    3.5-flash"
+    "gemini-3.5-flash"
 ).strip()
 
 DATA_FILE = "mog_data.json"
 
-# ============================================================
-# CARD FONT SCALE
-# ============================================================
-#
-# 1.0 = базовый размер
-# 1.25 = +25%
-# 1.5 = +50%
-# 2.0 = в 2 раза больше
-#
-# Меняешь ТОЛЬКО ЭТО число.
-#
-
-FONT_SCALE = 1.5
-
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN is not set"
-    )
+    raise RuntimeError("BOT_TOKEN is not set")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not set"
-    )
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
 
 logging.basicConfig(
@@ -74,18 +56,25 @@ dp = Dispatcher()
 
 
 # ============================================================
-# SCORING
+# CARD FONT SETTINGS
+# ============================================================
+#
+# Меняешь ТОЛЬКО ЭТО:
+#
+# 1.0 = обычный размер
+# 1.25 = немного больше
+# 1.5 = крупный
+# 2.0 = очень крупный
+#
+# Сейчас стоит 1.5x.
 # ============================================================
 
-# Сумма = 1.00
-#
-# AVATAR    25%
-# USERNAME  17%
-# NAME      13%
-# BIO       17%
-# COHERENCE 14%
-# VIBE      14%
-#
+FONT_SCALE = 1.5
+
+
+# ============================================================
+# SCORING
+# ============================================================
 
 WEIGHTS = {
     "avatar": 0.25,
@@ -158,15 +147,8 @@ def load_data():
                 "battles": []
             }
 
-        data.setdefault(
-            "users",
-            {}
-        )
-
-        data.setdefault(
-            "battles",
-            []
-        )
+        data.setdefault("users", {})
+        data.setdefault("battles", [])
 
         return data
 
@@ -184,10 +166,7 @@ def load_data():
 
 def save_data(data):
 
-    temporary_file = (
-        DATA_FILE
-        + ".tmp"
-    )
+    temporary_file = DATA_FILE + ".tmp"
 
     try:
 
@@ -222,9 +201,7 @@ def ensure_user(
     username
 ):
 
-    user_id = str(
-        user_id
-    )
+    user_id = str(user_id)
 
     if user_id not in data["users"]:
 
@@ -239,9 +216,7 @@ def ensure_user(
 
     else:
 
-        data["users"][user_id][
-            "username"
-        ] = username
+        data["users"][user_id]["username"] = username
 
 
 def register_battle(
@@ -264,21 +239,11 @@ def register_battle(
         player2.username
     )
 
-    p1 = data["users"][
-        str(player1.user_id)
-    ]
+    p1 = data["users"][str(player1.user_id)]
+    p2 = data["users"][str(player2.user_id)]
 
-    p2 = data["users"][
-        str(player2.user_id)
-    ]
-
-    score1 = result[
-        "players"
-    ][0]["overall"]
-
-    score2 = result[
-        "players"
-    ][1]["overall"]
+    score1 = result["players"][0]["overall"]
+    score2 = result["players"][1]["overall"]
 
     p1["battles"] += 1
     p2["battles"] += 1
@@ -304,36 +269,21 @@ def register_battle(
     battle = {
         "time": datetime.utcnow().isoformat(),
 
-        "player1":
-            player1.username,
+        "player1": player1.username,
+        "player2": player2.username,
 
-        "player2":
-            player2.username,
+        "score1": score1,
+        "score2": score2,
 
-        "score1":
-            score1,
-
-        "score2":
-            score2,
-
-        "winner":
-            result["winner"],
-
-        "status":
-            result["status"]
+        "winner": result["winner"],
+        "status": result["status"]
     }
 
-    data["battles"].append(
-        battle
-    )
+    data["battles"].append(battle)
 
-    data["battles"] = (
-        data["battles"][-500:]
-    )
+    data["battles"] = data["battles"][-500:]
 
-    save_data(
-        data
-    )
+    save_data(data)
 
 
 # ============================================================
@@ -345,9 +295,7 @@ async def get_profile(
     user_id: int
 ):
 
-    chat = await bot.get_chat(
-        user_id
-    )
+    chat = await bot.get_chat(user_id)
 
     username = (
         "@"
@@ -374,24 +322,17 @@ async def get_profile(
 
     try:
 
-        photos = (
-            await bot
-            .get_user_profile_photos(
-                user_id=user_id,
-                limit=1
-            )
+        photos = await bot.get_user_profile_photos(
+            user_id=user_id,
+            limit=1
         )
 
         if photos.total_count:
 
-            photo = (
-                photos.photos[0][-1]
-            )
+            photo = photos.photos[0][-1]
 
-            telegram_file = (
-                await bot.get_file(
-                    photo.file_id
-                )
+            telegram_file = await bot.get_file(
+                photo.file_id
             )
 
             buffer = io.BytesIO()
@@ -446,7 +387,6 @@ Score these categories from 0.0 to 10.0:
 5. coherence
 6. vibe
 
-
 AVATAR:
 Judge visual quality, composition, recognizability,
 originality and suitability as a profile avatar.
@@ -455,19 +395,16 @@ USERNAME:
 Judge readability, memorability, uniqueness and style.
 
 NAME:
-Judge the displayed Telegram name itself:
-readability, memorability, originality, visual style,
-and how well it works as a profile display name.
-
-Do NOT judge the person's identity,
-age, ethnicity, gender, religion or any other
-sensitive personal characteristic.
+Judge the displayed Telegram profile name itself:
+readability, memorability, style, originality, typography
+and how well it works as a displayed profile name.
 
 BIO:
 Judge writing quality, originality, personality and presentation.
 
 COHERENCE:
-Judge how well avatar, username, name and bio fit together.
+Judge how well avatar, username, displayed name and bio
+fit together as one profile.
 
 VIBE:
 Judge the overall profile presentation and style.
@@ -540,15 +477,12 @@ Required format:
 }
 """
 
-    def profile_text(
-        profile
-    ):
+    def profile_text(profile):
 
         return (
             f"USERNAME: {profile.username}\n"
             f"NAME: {profile.name}\n"
-            f"BIO: "
-            f"{profile.bio or '(нет био)'}"
+            f"BIO: {profile.bio or '(нет био)'}"
         )
 
     parts = [
@@ -560,19 +494,13 @@ Required format:
         {
             "text":
                 "\n\nPLAYER 1\n"
-                +
-                profile_text(
-                    player1
-                )
+                + profile_text(player1)
         },
 
         {
             "text":
                 "\n\nPLAYER 2\n"
-                +
-                profile_text(
-                    player2
-                )
+                + profile_text(player2)
         }
     ]
 
@@ -581,15 +509,11 @@ Required format:
         parts.append(
             {
                 "inline_data": {
-                    "mime_type":
-                        "image/jpeg",
-
+                    "mime_type": "image/jpeg",
                     "data":
                         base64.b64encode(
                             player1.avatar
-                        ).decode(
-                            "utf-8"
-                        )
+                        ).decode("utf-8")
                 }
             }
         )
@@ -606,15 +530,11 @@ Required format:
         parts.append(
             {
                 "inline_data": {
-                    "mime_type":
-                        "image/jpeg",
-
+                    "mime_type": "image/jpeg",
                     "data":
                         base64.b64encode(
                             player2.avatar
-                        ).decode(
-                            "utf-8"
-                        )
+                        ).decode("utf-8")
                 }
             }
         )
@@ -640,8 +560,7 @@ Required format:
 
         "generationConfig": {
             "temperature": 0.25,
-            "responseMimeType":
-                "application/json"
+            "responseMimeType": "application/json"
         }
     }
 
@@ -652,8 +571,7 @@ Required format:
         response = await client.post(
             url,
             params={
-                "key":
-                    GEMINI_API_KEY
+                "key": GEMINI_API_KEY
             },
             json=payload
         )
@@ -673,15 +591,8 @@ Required format:
     try:
 
         text = (
-            data[
-                "candidates"
-            ][0][
-                "content"
-            ][
-                "parts"
-            ][0][
-                "text"
-            ]
+            data["candidates"][0]
+            ["content"]["parts"][0]["text"]
         )
 
     except Exception:
@@ -744,15 +655,11 @@ Required format:
 # SCORE CALCULATION
 # ============================================================
 
-def clamp(
-    value
-):
+def clamp(value):
 
     try:
 
-        value = float(
-            value
-        )
+        value = float(value)
 
     except Exception:
 
@@ -799,10 +706,7 @@ def calculate_scores(
             )
 
         overall = sum(
-            scores[key]
-            *
-            WEIGHTS[key]
-
+            scores[key] * WEIGHTS[key]
             for key in WEIGHTS
         )
 
@@ -811,17 +715,13 @@ def calculate_scores(
             2
         )
 
-        players.append(
-            scores
-        )
+        players.append(scores)
 
     score1 = players[0]["overall"]
     score2 = players[1]["overall"]
 
     difference = round(
-        abs(
-            score1 - score2
-        ),
+        abs(score1 - score2),
         2
     )
 
@@ -837,15 +737,12 @@ def calculate_scores(
         loser = 1
 
         if difference >= 2.0:
-
             status = "ABSOLUTE MOG"
 
         elif difference >= 1.0:
-
             status = "DOMINATED"
 
         else:
-
             status = "MOGGED"
 
     else:
@@ -854,15 +751,12 @@ def calculate_scores(
         loser = 0
 
         if difference >= 2.0:
-
             status = "ABSOLUTE MOG"
 
         elif difference >= 1.0:
-
             status = "DOMINATED"
 
         else:
-
             status = "MOGGED"
 
     if winner is None:
@@ -871,36 +765,21 @@ def calculate_scores(
 
     else:
 
-        winner_name = names[
-            winner
-        ]
+        winner_name = names[winner]
 
     return {
-        "players":
-            players,
-
-        "winner":
-            winner,
-
-        "loser":
-            loser,
-
-        "winner_name":
-            winner_name,
-
-        "difference":
-            difference,
-
-        "status":
-            status,
-
-        "verdict":
-            str(
-                ai_result.get(
-                    "verdict",
-                    "Нет вердикта."
-                )
-            )[:300]
+        "players": players,
+        "winner": winner,
+        "loser": loser,
+        "winner_name": winner_name,
+        "difference": difference,
+        "status": status,
+        "verdict": str(
+            ai_result.get(
+                "verdict",
+                "Нет вердикта."
+            )
+        )[:300]
     }
 
 
@@ -941,25 +820,21 @@ def get_font(
     return ImageFont.load_default()
 
 
-# ============================================================
-# IMPORTANT:
-# ALL CARD TEXT GOES THROUGH THIS FUNCTION
-# ============================================================
-
 def card_font(
     size,
     bold=False
 ):
+    """
+    Единая функция для ВСЕХ шрифтов карточки.
+
+    FONT_SCALE = 1.5 означает,
+    что каждый размер ниже автоматически
+    увеличивается в 1.5 раза.
+    """
 
     scaled_size = max(
         1,
-        int(
-            round(
-                size
-                *
-                FONT_SCALE
-            )
-        )
+        int(size * FONT_SCALE)
     )
 
     return get_font(
@@ -979,16 +854,8 @@ def make_avatar(
 
     result = Image.new(
         "RGBA",
-        (
-            size,
-            size
-        ),
-        (
-            0,
-            0,
-            0,
-            0
-        )
+        (size, size),
+        (0, 0, 0, 0)
     )
 
     if data:
@@ -997,13 +864,9 @@ def make_avatar(
 
             avatar = Image.open(
                 io.BytesIO(data)
-            ).convert(
-                "RGB"
-            )
+            ).convert("RGB")
 
-            width, height = (
-                avatar.size
-            )
+            width, height = avatar.size
 
             side = min(
                 width,
@@ -1028,10 +891,7 @@ def make_avatar(
             )
 
             avatar = avatar.resize(
-                (
-                    size,
-                    size
-                ),
+                (size, size),
                 Image.Resampling.LANCZOS
             )
 
@@ -1039,10 +899,7 @@ def make_avatar(
 
             avatar = Image.new(
                 "RGB",
-                (
-                    size,
-                    size
-                ),
+                (size, size),
                 "#25252d"
             )
 
@@ -1050,25 +907,17 @@ def make_avatar(
 
         avatar = Image.new(
             "RGB",
-            (
-                size,
-                size
-            ),
+            (size, size),
             "#25252d"
         )
 
     mask = Image.new(
         "L",
-        (
-            size,
-            size
-        ),
+        (size, size),
         0
     )
 
-    mask_draw = ImageDraw.Draw(
-        mask
-    )
+    mask_draw = ImageDraw.Draw(mask)
 
     mask_draw.ellipse(
         (
@@ -1082,16 +931,11 @@ def make_avatar(
 
     result.paste(
         avatar,
-        (
-            0,
-            0
-        ),
+        (0, 0),
         mask
     )
 
-    draw = ImageDraw.Draw(
-        result
-    )
+    draw = ImageDraw.Draw(result)
 
     draw.ellipse(
         (
@@ -1141,16 +985,11 @@ def create_card(
 
     image = Image.new(
         "RGB",
-        (
-            W,
-            H
-        ),
+        (W, H),
         BG
     )
 
-    draw = ImageDraw.Draw(
-        image
-    )
+    draw = ImageDraw.Draw(image)
 
     # ========================================================
     # HELPERS
@@ -1165,10 +1004,7 @@ def create_card(
     ):
 
         bbox = draw.textbbox(
-            (
-                0,
-                0
-            ),
+            (0, 0),
             text,
             font=font
         )
@@ -1181,9 +1017,7 @@ def create_card(
 
         draw.text(
             (
-                center_x
-                -
-                width / 2,
+                center_x - width / 2,
                 y
             ),
             text,
@@ -1196,84 +1030,15 @@ def create_card(
         max_chars
     ):
 
-        text = str(
-            text or ""
-        )
+        text = str(text or "")
 
         if len(text) <= max_chars:
-
             return text
 
         return (
-            text[
-                :max_chars - 1
-            ]
+            text[:max_chars - 1]
             + "…"
         )
-
-    def wrap_text(
-        text,
-        font,
-        max_width
-    ):
-
-        words = str(
-            text or ""
-        ).split()
-
-        if not words:
-
-            return [""]
-
-        lines = []
-        current = ""
-
-        for word in words:
-
-            test = (
-                word
-                if not current
-                else current
-                + " "
-                + word
-            )
-
-            bbox = draw.textbbox(
-                (
-                    0,
-                    0
-                ),
-                test,
-                font=font
-            )
-
-            width = (
-                bbox[2]
-                -
-                bbox[0]
-            )
-
-            if width <= max_width:
-
-                current = test
-
-            else:
-
-                if current:
-
-                    lines.append(
-                        current
-                    )
-
-                current = word
-
-        if current:
-
-            lines.append(
-                current
-            )
-
-        return lines
 
     # ========================================================
     # HEADER
@@ -1302,7 +1067,7 @@ def create_card(
     )
 
     # ========================================================
-    # PLAYERS
+    # PLAYER PANELS
     # ========================================================
 
     players = [
@@ -1316,7 +1081,7 @@ def create_card(
     ]
 
     avatar_size = 250
-    avatar_y = 215
+    avatar_y = 210
 
     for i, (
         player,
@@ -1328,16 +1093,12 @@ def create_card(
         )
     ):
 
-        # ====================================================
-        # PLAYER PANEL
-        # ====================================================
-
         draw.rounded_rectangle(
             (
                 center_x - 310,
-                185,
+                175,
                 center_x + 310,
-                570
+                585
             ),
             radius=28,
             fill=PANEL,
@@ -1351,7 +1112,7 @@ def create_card(
 
         if result["winner"] == i:
 
-            crown_y = 145
+            crown_y = 135
 
             draw.rounded_rectangle(
                 (
@@ -1427,8 +1188,7 @@ def create_card(
 
         avatar_x = (
             center_x
-            -
-            avatar_size // 2
+            - avatar_size // 2
         )
 
         image.paste(
@@ -1455,12 +1215,7 @@ def create_card(
                     stamp_w,
                     stamp_h
                 ),
-                (
-                    0,
-                    0,
-                    0,
-                    0
-                )
+                (0, 0, 0, 0)
             )
 
             stamp_draw = ImageDraw.Draw(
@@ -1507,17 +1262,15 @@ def create_card(
             stamp = stamp.rotate(
                 12,
                 expand=True,
-                resample=
-                    Image.Resampling.BICUBIC
+                resample=Image.Resampling.BICUBIC
             )
 
             stamp_x = (
                 center_x
-                -
-                stamp.width // 2
+                - stamp.width // 2
             )
 
-            stamp_y = 355
+            stamp_y = 365
 
             image.paste(
                 stamp,
@@ -1560,7 +1313,7 @@ def create_card(
         text_center(
             name,
             center_x,
-            525,
+            530,
             card_font(
                 21
             ),
@@ -1571,42 +1324,39 @@ def create_card(
     # SCORE BARS
     # ========================================================
 
-    bar_left = 75
-    bar_right = 650
+    bar_left = 90
+    bar_right = 670
 
-    bar_left_2 = 790
-    bar_right_2 = 1365
+    bar_left_2 = 810
+    bar_right_2 = 1390
 
     bar_width = (
         bar_right
-        -
-        bar_left
+        - bar_left
     )
 
-    bar_height = 24
+    bar_height = 23
 
-    label_y = 625
+    # ========================================================
+    # SIX CATEGORIES
+    # ========================================================
 
-    row_height = 125
+    label_y = 635
+
+    category_step = 115
 
     for category_index, (
         label,
         key
-    ) in enumerate(
-        CATEGORIES
-    ):
+    ) in enumerate(CATEGORIES):
 
         y = (
             label_y
             +
-            category_index
-            *
-            row_height
+            category_index * category_step
         )
 
-        # ====================================================
-        # CATEGORY LABELS
-        # ====================================================
+        # Left category label
 
         draw.text(
             (
@@ -1620,6 +1370,8 @@ def create_card(
             ),
             fill=MUTED
         )
+
+        # Right category label
 
         draw.text(
             (
@@ -1635,7 +1387,7 @@ def create_card(
         )
 
         # ====================================================
-        # BOTH BARS
+        # TWO PLAYER BARS
         # ====================================================
 
         for i, x in enumerate(
@@ -1672,7 +1424,7 @@ def create_card(
                 fill=BAR_BG
             )
 
-            # Yellow fill
+            # Score bar
 
             if actual_width > 0:
 
@@ -1692,7 +1444,7 @@ def create_card(
             draw.text(
                 (
                     x + bar_width + 15,
-                    bar_y - 7
+                    bar_y - 6
                 ),
                 f"{score:.1f}",
                 font=card_font(
@@ -1706,11 +1458,11 @@ def create_card(
     # OVERALL
     # ========================================================
 
-    overall_y = 1400
+    overall_y = 1360
 
     draw.text(
         (
-            75,
+            90,
             overall_y
         ),
         "OVERALL",
@@ -1752,11 +1504,9 @@ def create_card(
                 x,
                 bar_y,
                 x + bar_width,
-                bar_y
-                +
-                overall_bar_height
+                bar_y + overall_bar_height
             ),
-            radius=20,
+            radius=21,
             fill=PURPLE_DARK
         )
 
@@ -1767,18 +1517,16 @@ def create_card(
                     x,
                     bar_y,
                     x + actual_width,
-                    bar_y
-                    +
-                    overall_bar_height
+                    bar_y + overall_bar_height
                 ),
-                radius=20,
+                radius=21,
                 fill=PURPLE
             )
 
         draw.text(
             (
                 x + bar_width + 15,
-                bar_y - 10
+                bar_y - 9
             ),
             f"{score:.2f}",
             font=card_font(
@@ -1792,11 +1540,11 @@ def create_card(
     # RESULT
     # ========================================================
 
-    result_y = 1535
+    result_y = 1515
 
     draw.text(
         (
-            75,
+            90,
             result_y
         ),
         result["status"],
@@ -1819,23 +1567,16 @@ def create_card(
             result["winner_name"]
         )
 
-    winner_font = card_font(
-        44,
-        True
-    )
-
-    winner_text = truncate(
-        winner_text,
-        30
-    )
-
     draw.text(
         (
-            75,
+            90,
             result_y + 60
         ),
         winner_text,
-        font=winner_font,
+        font=card_font(
+            44,
+            True
+        ),
         fill=PURPLE
     )
 
@@ -1850,42 +1591,24 @@ def create_card(
         )
     )
 
-    verdict_font = card_font(
-        23
-    )
+    if len(verdict) > 100:
 
-    verdict_lines = wrap_text(
-        verdict,
-        verdict_font,
-        W - 150
-    )
-
-    verdict_lines = verdict_lines[:2]
-
-    verdict_y = (
-        result_y
-        + 135
-    )
-
-    line_spacing = 40
-
-    for line_index, line in enumerate(
-        verdict_lines
-    ):
-
-        draw.text(
-            (
-                75,
-                verdict_y
-                +
-                line_index
-                *
-                line_spacing
-            ),
-            line,
-            font=verdict_font,
-            fill=WHITE
+        verdict = (
+            verdict[:97]
+            + "..."
         )
+
+    draw.text(
+        (
+            90,
+            result_y + 135
+        ),
+        verdict,
+        font=card_font(
+            23
+        ),
+        fill=WHITE
+    )
 
     # ========================================================
     # FOOTER
@@ -1893,8 +1616,8 @@ def create_card(
 
     draw.text(
         (
-            75,
-            H - 55
+            90,
+            H - 60
         ),
         "MOG AI  •  POWERED BY GEMINI",
         font=card_font(
@@ -1928,9 +1651,7 @@ def result_keyboard(
     player2_id
 ):
 
-    builder = (
-        InlineKeyboardBuilder()
-    )
+    builder = InlineKeyboardBuilder()
 
     builder.button(
         text="🔄 Rematch",
@@ -2007,18 +1728,12 @@ async def resolve_target(
         match.group(2)
     ):
 
-        username = (
-            match.group(2)
-        )
+        username = match.group(2)
 
         try:
 
-            target = (
-                await bot.get_chat(
-                    "@"
-                    +
-                    username
-                )
+            target = await bot.get_chat(
+                "@" + username
             )
 
             return (
@@ -2087,11 +1802,9 @@ async def run_mog(
         # GEMINI
         # ====================================================
 
-        ai_result = (
-            await analyze_with_gemini(
-                player1,
-                player2
-            )
+        ai_result = await analyze_with_gemini(
+            player1,
+            player2
         )
 
         # ====================================================
@@ -2136,16 +1849,16 @@ async def run_mog(
 
         if result["winner"] is None:
 
-            winner_text = (
-                "🤝 <b>DRAW</b>"
-            )
+            winner_text = "🤝 <b>DRAW</b>"
 
         else:
 
             winner_text = (
                 "👑 <b>"
                 +
-                result["winner_name"]
+                html.escape(
+                    result["winner_name"]
+                )
                 +
                 "</b>"
             )
@@ -2153,10 +1866,10 @@ async def run_mog(
         caption = (
             "⚔️ <b>MOG BATTLE</b>\n\n"
 
-            f"{player1.username} "
+            f"{html.escape(player1.username)} "
             f"<b>{score1:.2f}/10</b>\n"
 
-            f"{player2.username} "
+            f"{html.escape(player2.username)} "
             f"<b>{score2:.2f}/10</b>\n\n"
 
             f"{winner_text}\n"
@@ -2164,7 +1877,8 @@ async def run_mog(
             f"📊 Difference: "
             f"<b>{result['difference']:.2f}</b>\n\n"
 
-            f"💬 {result['verdict']}"
+            f"💬 "
+            f"{html.escape(result['verdict'])}"
         )
 
         # ====================================================
@@ -2197,27 +1911,26 @@ async def run_mog(
             "MOG failed"
         )
 
-        error_text = str(
-            error
-        )
+        error_text = str(error)
 
         if len(error_text) > 900:
 
             error_text = (
                 error_text[:900]
-                +
-                "..."
+                + "..."
             )
+
+        safe_error = html.escape(
+            error_text
+        )
 
         try:
 
             await status_message.edit_text(
                 "❌ <b>MOG FAILED</b>\n\n"
                 "<code>"
-                +
-                error_text
-                +
-                "</code>"
+                + safe_error
+                + "</code>"
             )
 
         except Exception:
@@ -2225,10 +1938,8 @@ async def run_mog(
             await message.answer(
                 "❌ <b>MOG FAILED</b>\n\n"
                 "<code>"
-                +
-                error_text
-                +
-                "</code>"
+                + safe_error
+                + "</code>"
             )
 
 
@@ -2367,9 +2078,7 @@ async def stats_command(
         message.from_user.id
     )
 
-    user = data[
-        "users"
-    ].get(
+    user = data["users"].get(
         user_id
     )
 
@@ -2381,21 +2090,10 @@ async def stats_command(
 
         return
 
-    battles = user[
-        "battles"
-    ]
-
-    wins = user[
-        "wins"
-    ]
-
-    losses = user[
-        "losses"
-    ]
-
-    draws = user[
-        "draws"
-    ]
+    battles = user["battles"]
+    wins = user["wins"]
+    losses = user["losses"]
+    draws = user["draws"]
 
     if battles > 0:
 
@@ -2456,12 +2154,9 @@ async def top_command(
 
     users = []
 
-    for user_id, user in (
-        data["users"].items()
-    ):
+    for user_id, user in data["users"].items():
 
         if user["battles"] <= 0:
-
             continue
 
         average = (
@@ -2514,15 +2209,11 @@ async def top_command(
         "🥉"
     ]
 
-    for index, user in enumerate(
-        users
-    ):
+    for index, user in enumerate(users):
 
         if index < 3:
 
-            position = medals[
-                index
-            ]
+            position = medals[index]
 
         else:
 
@@ -2532,14 +2223,12 @@ async def top_command(
 
         text += (
             f"{position} "
-            f"{user['username']} — "
+            f"{html.escape(user['username'])} — "
             f"<b>{user['wins']}</b> wins "
             f"• {user['average']:.2f}/10\n"
         )
 
-    await message.answer(
-        text
-    )
+    await message.answer(text)
 
 
 # ============================================================
@@ -2555,9 +2244,7 @@ async def history_command(
 
     data = load_data()
 
-    battles = (
-        data["battles"][-10:]
-    )
+    battles = data["battles"][-10:]
 
     if not battles:
 
@@ -2577,15 +2264,11 @@ async def history_command(
 
         if battle["winner"] == 0:
 
-            winner = (
-                battle["player1"]
-            )
+            winner = battle["player1"]
 
         elif battle["winner"] == 1:
 
-            winner = (
-                battle["player2"]
-            )
+            winner = battle["player2"]
 
         else:
 
@@ -2593,18 +2276,16 @@ async def history_command(
 
         text += (
             f"⚔️ "
-            f"{battle['player1']} "
+            f"{html.escape(battle['player1'])} "
             f"<b>{battle['score1']:.2f}</b>"
             f" × "
             f"<b>{battle['score2']:.2f}</b> "
-            f"{battle['player2']}\n"
+            f"{html.escape(battle['player2'])}\n"
 
-            f"🏆 {winner}\n\n"
+            f"🏆 {html.escape(winner)}\n\n"
         )
 
-    await message.answer(
-        text
-    )
+    await message.answer(text)
 
 
 # ============================================================
@@ -2612,9 +2293,7 @@ async def history_command(
 # ============================================================
 
 @dp.callback_query(
-    F.data.startswith(
-        "rematch:"
-    )
+    F.data.startswith("rematch:")
 )
 async def rematch_callback(
     callback: CallbackQuery,
@@ -2623,10 +2302,7 @@ async def rematch_callback(
 
     try:
 
-        parts = (
-            callback.data
-            .split(":")
-        )
+        parts = callback.data.split(":")
 
         if len(parts) != 3:
 
@@ -2634,13 +2310,8 @@ async def rematch_callback(
                 "Invalid callback data"
             )
 
-        player1_id = int(
-            parts[1]
-        )
-
-        player2_id = int(
-            parts[2]
-        )
+        player1_id = int(parts[1])
+        player2_id = int(parts[2])
 
         await callback.answer(
             "🔄 Новый MOG!"
@@ -2718,9 +2389,7 @@ async def main():
             me.username
         )
 
-        await dp.start_polling(
-            bot
-        )
+        await dp.start_polling(bot)
 
     finally:
 
@@ -2733,6 +2402,4 @@ async def main():
 
 if __name__ == "__main__":
 
-    asyncio.run(
-        main()
-    )
+    asyncio.run(main())
