@@ -31,7 +31,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash"
+    "gemini-2.5-flash"
 ).strip()
 
 DATA_FILE = "mog_data.json"
@@ -54,7 +54,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("mog_ai")
-
 
 dp = Dispatcher()
 
@@ -301,7 +300,6 @@ def register_battle(
         battle
     )
 
-    # Keep only latest 500 battles.
     data["battles"] = (
         data["battles"][-500:]
     )
@@ -415,7 +413,7 @@ The goal is to judge profile presentation, not the person.
 Score these categories from 0.0 to 10.0:
 
 1. avatar
-2. nickname
+2. username
 3. bio
 4. coherence
 5. vibe
@@ -785,8 +783,6 @@ def calculate_scores(
         2
     )
 
-    # Very close result = draw.
-
     if difference < 0.10:
 
         winner = None
@@ -909,7 +905,7 @@ def get_font(
 
 def make_avatar(
     data,
-    size=300
+    size=250
 ):
 
     result = Image.new(
@@ -1141,9 +1137,9 @@ def create_card(
     text_center(
         "MOG BATTLE",
         W // 2,
-        35,
+        38,
         get_font(
-            52,
+            108,
             True
         ),
         WHITE
@@ -1152,9 +1148,9 @@ def create_card(
     text_center(
         "AI PROFILE COMPARISON",
         W // 2,
-        22,
+        112,
         get_font(
-            50,
+            42,
             True
         ),
         MUTED
@@ -1203,54 +1199,52 @@ def create_card(
         )
 
         # ====================================================
-        # WINNER CROWN (Увеличенный размер и пропорции)
+        # WINNER CROWN
         # ====================================================
 
         if result["winner"] == i:
 
-            crown_y = 115
-
-            # Crown base
+            crown_y = 128
 
             draw.rounded_rectangle(
                 (
-                    center_x - 95,
-                    crown_y + 52,
-                    center_x + 95,
-                    crown_y + 78
+                    center_x - 82,
+                    crown_y + 45,
+                    center_x + 82,
+                    crown_y + 68
                 ),
-                radius=8,
+                radius=7,
                 fill=YELLOW
             )
 
             crown_points = [
                 (
-                    center_x - 92,
-                    crown_y + 55
+                    center_x - 80,
+                    crown_y + 48
                 ),
                 (
-                    center_x - 74,
-                    crown_y - 4
+                    center_x - 64,
+                    crown_y - 3
                 ),
                 (
-                    center_x - 24,
-                    crown_y + 34
+                    center_x - 20,
+                    crown_y + 29
                 ),
                 (
                     center_x,
-                    crown_y - 22
+                    crown_y - 18
                 ),
                 (
-                    center_x + 24,
-                    crown_y + 34
+                    center_x + 20,
+                    crown_y + 29
                 ),
                 (
-                    center_x + 74,
-                    crown_y - 4
+                    center_x + 64,
+                    crown_y - 3
                 ),
                 (
-                    center_x + 92,
-                    crown_y + 55
+                    center_x + 80,
+                    crown_y + 48
                 )
             ]
 
@@ -1260,17 +1254,17 @@ def create_card(
             )
 
             for jewel_x in [
-                center_x - 74,
+                center_x - 64,
                 center_x,
-                center_x + 74
+                center_x + 64
             ]:
 
                 draw.ellipse(
                     (
-                        jewel_x - 7,
-                        crown_y + 32,
-                        jewel_x + 7,
-                        crown_y + 46
+                        jewel_x - 6,
+                        crown_y + 28,
+                        jewel_x + 6,
+                        crown_y + 40
                     ),
                     fill=PURPLE
                 )
@@ -1300,13 +1294,13 @@ def create_card(
         )
 
         # ====================================================
-        # MOGGED STAMP (Увеличенный размер шрифта и плашки)
+        # MOGGED STAMP
         # ====================================================
 
         if result["loser"] == i:
 
-            stamp_w = 380
-            stamp_h = 100
+            stamp_w = 350
+            stamp_h = 90
 
             stamp = Image.new(
                 "RGBA",
@@ -1333,18 +1327,18 @@ def create_card(
                     stamp_w - 3,
                     stamp_h - 3
                 ),
-                radius=18,
+                radius=16,
                 fill=(
                     255,
                     48,
                     48,
-                    235
+                    225
                 ),
                 outline=(
                     255,
                     255,
                     255,
-                    200
+                    180
                 ),
                 width=3
             )
@@ -1352,11 +1346,11 @@ def create_card(
             stamp_draw.text(
                 (
                     stamp_w // 2,
-                    12
+                    10
                 ),
                 "MOGGED",
                 font=get_font(
-                    58,
+                    50,
                     True
                 ),
                 fill="white",
@@ -1376,7 +1370,7 @@ def create_card(
                 stamp.width // 2
             )
 
-            stamp_y = 320
+            stamp_y = 330
 
             image.paste(
                 stamp,
@@ -1388,7 +1382,7 @@ def create_card(
             )
 
         # ====================================================
-        # USERNAME (Шрифт увеличен)
+        # USERNAME
         # ====================================================
 
         username = truncate(
@@ -1399,16 +1393,16 @@ def create_card(
         text_center(
             username,
             center_x,
-            453,
+            455,
             get_font(
-                34,
+                57,
                 True
             ),
             WHITE
         )
 
         # ====================================================
-        # NAME (Шрифт увеличен)
+        # NAME
         # ====================================================
 
         name = truncate(
@@ -1419,9 +1413,9 @@ def create_card(
         text_center(
             name,
             center_x,
-            497,
+            500,
             get_font(
-                23
+                36
             ),
             MUTED
         )
@@ -1459,7 +1453,7 @@ def create_card(
             category_index * 100
         )
 
-        # Left label (Шрифт увеличен)
+        # Left label
 
         draw.text(
             (
@@ -1468,13 +1462,13 @@ def create_card(
             ),
             label,
             font=get_font(
-                26,
+                41,
                 True
             ),
             fill=MUTED
         )
 
-        # Right label (Шрифт увеличен)
+        # Right label
 
         draw.text(
             (
@@ -1483,7 +1477,7 @@ def create_card(
             ),
             label,
             font=get_font(
-                26,
+                41,
                 True
             ),
             fill=MUTED
@@ -1510,8 +1504,6 @@ def create_card(
                 10
             )
 
-            # Background
-
             draw.rounded_rectangle(
                 (
                     x,
@@ -1522,8 +1514,6 @@ def create_card(
                 radius=12,
                 fill=BAR_BG
             )
-
-            # Yellow
 
             if actual_width > 0:
 
@@ -1538,16 +1528,14 @@ def create_card(
                     fill=YELLOW
                 )
 
-            # Score (Шрифт увеличен)
-
             draw.text(
                 (
                     x + bar_width + 15,
-                    bar_y - 6
+                    bar_y - 5
                 ),
                 f"{score:.1f}",
                 font=get_font(
-                    26,
+                    41,
                     True
                 ),
                 fill=WHITE
@@ -1566,7 +1554,7 @@ def create_card(
         ),
         "OVERALL",
         font=get_font(
-            32,
+            48,
             True
         ),
         fill=MUTED
@@ -1622,15 +1610,14 @@ def create_card(
                 fill=PURPLE
             )
 
-        # Шрифт overall увеличен
         draw.text(
             (
                 x + bar_width + 15,
-                bar_y - 7
+                bar_y - 8
             ),
             f"{score:.2f}",
             font=get_font(
-                34,
+                54,
                 True
             ),
             fill=WHITE
@@ -1642,7 +1629,6 @@ def create_card(
 
     result_y = 1260
 
-    # Статус (например, ABSOLUTE MOG) - шрифт увеличен
     draw.text(
         (
             90,
@@ -1650,7 +1636,7 @@ def create_card(
         ),
         result["status"],
         font=get_font(
-            34,
+            54,
             True
         ),
         fill=RED
@@ -1668,15 +1654,14 @@ def create_card(
             result["winner_name"]
         )
 
-    # Имя победителя - шрифт увеличен
     draw.text(
         (
             90,
-            result_y + 52
+            result_y + 55
         ),
         winner_text,
         font=get_font(
-            48,
+            75,
             True
         ),
         fill=PURPLE
@@ -1701,15 +1686,14 @@ def create_card(
             "..."
         )
 
-    # Вердикт - шрифт слегка увеличен для лучшей читаемости
     draw.text(
         (
             90,
-            result_y + 122
+            result_y + 120
         ),
         verdict,
         font=get_font(
-            26
+            41
         ),
         fill=WHITE
     )
@@ -1721,11 +1705,11 @@ def create_card(
     draw.text(
         (
             90,
-            H - 52
+            H - 55
         ),
         "MOG AI  •  POWERED BY GEMINI",
         font=get_font(
-            20,
+            30,
             True
         ),
         fill=MUTED
@@ -1790,10 +1774,6 @@ async def resolve_target(
     bot: Bot
 ):
 
-    # ========================================================
-    # REPLY MODE
-    # ========================================================
-
     if (
         message.reply_to_message
         and
@@ -1811,10 +1791,6 @@ async def resolve_target(
             message.from_user.id,
             target_user_id
         )
-
-    # ========================================================
-    # USERNAME MODE
-    # ========================================================
 
     text = (
         message.text
@@ -1895,10 +1871,6 @@ async def run_mog(
 
     try:
 
-        # ====================================================
-        # PROFILES
-        # ====================================================
-
         player1 = await get_profile(
             bot,
             player1_id
@@ -1909,20 +1881,12 @@ async def run_mog(
             player2_id
         )
 
-        # ====================================================
-        # GEMINI
-        # ====================================================
-
         ai_result = (
             await analyze_with_gemini(
                 player1,
                 player2
             )
         )
-
-        # ====================================================
-        # SCORES
-        # ====================================================
 
         result = calculate_scores(
             ai_result,
@@ -1932,19 +1896,11 @@ async def run_mog(
             ]
         )
 
-        # ====================================================
-        # SAVE STATS
-        # ====================================================
-
         register_battle(
             player1,
             player2,
             result
         )
-
-        # ====================================================
-        # CREATE CARD
-        # ====================================================
 
         card = create_card(
             player1,
@@ -1992,10 +1948,6 @@ async def run_mog(
 
             f"💬 {result['verdict']}"
         )
-
-        # ====================================================
-        # SEND CARD
-        # ====================================================
 
         await message.answer_photo(
             BufferedInputFile(
@@ -2555,4 +2507,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         main()
-    )
+        )
