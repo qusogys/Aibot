@@ -1141,9 +1141,9 @@ def create_card(
     text_center(
         "MOG BATTLE",
         W // 2,
-        38,
+        35,
         get_font(
-            64,
+            52,
             True
         ),
         WHITE
@@ -1152,9 +1152,9 @@ def create_card(
     text_center(
         "AI PROFILE COMPARISON",
         W // 2,
-        112,
+        100,
         get_font(
-            25,
+            22,
             True
         ),
         MUTED
@@ -1203,54 +1203,54 @@ def create_card(
         )
 
         # ====================================================
-        # WINNER CROWN
+        # WINNER CROWN (Увеличенный размер и пропорции)
         # ====================================================
 
         if result["winner"] == i:
 
-            crown_y = 128
+            crown_y = 115
 
             # Crown base
 
             draw.rounded_rectangle(
                 (
-                    center_x - 82,
-                    crown_y + 45,
-                    center_x + 82,
-                    crown_y + 68
+                    center_x - 95,
+                    crown_y + 52,
+                    center_x + 95,
+                    crown_y + 78
                 ),
-                radius=7,
+                radius=8,
                 fill=YELLOW
             )
 
             crown_points = [
                 (
-                    center_x - 80,
-                    crown_y + 48
+                    center_x - 92,
+                    crown_y + 55
                 ),
                 (
-                    center_x - 64,
-                    crown_y - 3
+                    center_x - 74,
+                    crown_y - 4
                 ),
                 (
-                    center_x - 20,
-                    crown_y + 29
+                    center_x - 24,
+                    crown_y + 34
                 ),
                 (
                     center_x,
-                    crown_y - 18
+                    crown_y - 22
                 ),
                 (
-                    center_x + 20,
-                    crown_y + 29
+                    center_x + 24,
+                    crown_y + 34
                 ),
                 (
-                    center_x + 64,
-                    crown_y - 3
+                    center_x + 74,
+                    crown_y - 4
                 ),
                 (
-                    center_x + 80,
-                    crown_y + 48
+                    center_x + 92,
+                    crown_y + 55
                 )
             ]
 
@@ -1260,17 +1260,17 @@ def create_card(
             )
 
             for jewel_x in [
-                center_x - 64,
+                center_x - 74,
                 center_x,
-                center_x + 64
+                center_x + 74
             ]:
 
                 draw.ellipse(
                     (
-                        jewel_x - 6,
-                        crown_y + 28,
-                        jewel_x + 6,
-                        crown_y + 40
+                        jewel_x - 7,
+                        crown_y + 32,
+                        jewel_x + 7,
+                        crown_y + 46
                     ),
                     fill=PURPLE
                 )
@@ -1300,13 +1300,13 @@ def create_card(
         )
 
         # ====================================================
-        # MOGGED STAMP
+        # MOGGED STAMP (Увеличенный размер шрифта и плашки)
         # ====================================================
 
         if result["loser"] == i:
 
-            stamp_w = 350
-            stamp_h = 90
+            stamp_w = 380
+            stamp_h = 100
 
             stamp = Image.new(
                 "RGBA",
@@ -1333,18 +1333,18 @@ def create_card(
                     stamp_w - 3,
                     stamp_h - 3
                 ),
-                radius=16,
+                radius=18,
                 fill=(
                     255,
                     48,
                     48,
-                    225
+                    235
                 ),
                 outline=(
                     255,
                     255,
                     255,
-                    180
+                    200
                 ),
                 width=3
             )
@@ -1352,11 +1352,11 @@ def create_card(
             stamp_draw.text(
                 (
                     stamp_w // 2,
-                    10
+                    12
                 ),
                 "MOGGED",
                 font=get_font(
-                    50,
+                    58,
                     True
                 ),
                 fill="white",
@@ -1376,7 +1376,7 @@ def create_card(
                 stamp.width // 2
             )
 
-            stamp_y = 330
+            stamp_y = 320
 
             image.paste(
                 stamp,
@@ -1388,7 +1388,7 @@ def create_card(
             )
 
         # ====================================================
-        # USERNAME
+        # USERNAME (Шрифт увеличен)
         # ====================================================
 
         username = truncate(
@@ -1399,16 +1399,16 @@ def create_card(
         text_center(
             username,
             center_x,
-            455,
+            453,
             get_font(
-                32,
+                34,
                 True
             ),
             WHITE
         )
 
         # ====================================================
-        # NAME
+        # NAME (Шрифт увеличен)
         # ====================================================
 
         name = truncate(
@@ -1419,9 +1419,9 @@ def create_card(
         text_center(
             name,
             center_x,
-            500,
+            497,
             get_font(
-                21
+                23
             ),
             MUTED
         )
@@ -1459,7 +1459,7 @@ def create_card(
             category_index * 100
         )
 
-        # Left label
+        # Left label (Шрифт увеличен)
 
         draw.text(
             (
@@ -1468,13 +1468,13 @@ def create_card(
             ),
             label,
             font=get_font(
-                24,
+                26,
                 True
             ),
             fill=MUTED
         )
 
-        # Right label
+        # Right label (Шрифт увеличен)
 
         draw.text(
             (
@@ -1483,7 +1483,7 @@ def create_card(
             ),
             label,
             font=get_font(
-                24,
+                26,
                 True
             ),
             fill=MUTED
@@ -1538,16 +1538,16 @@ def create_card(
                     fill=YELLOW
                 )
 
-            # Score
+            # Score (Шрифт увеличен)
 
             draw.text(
                 (
                     x + bar_width + 15,
-                    bar_y - 5
+                    bar_y - 6
                 ),
                 f"{score:.1f}",
                 font=get_font(
-                    24,
+                    26,
                     True
                 ),
                 fill=WHITE
@@ -1566,7 +1566,7 @@ def create_card(
         ),
         "OVERALL",
         font=get_font(
-            29,
+            32,
             True
         ),
         fill=MUTED
@@ -1622,14 +1622,15 @@ def create_card(
                 fill=PURPLE
             )
 
+        # Шрифт overall увеличен
         draw.text(
             (
                 x + bar_width + 15,
-                bar_y - 8
+                bar_y - 7
             ),
             f"{score:.2f}",
             font=get_font(
-                31,
+                34,
                 True
             ),
             fill=WHITE
@@ -1641,6 +1642,7 @@ def create_card(
 
     result_y = 1260
 
+    # Статус (например, ABSOLUTE MOG) - шрифт увеличен
     draw.text(
         (
             90,
@@ -1648,7 +1650,7 @@ def create_card(
         ),
         result["status"],
         font=get_font(
-            31,
+            34,
             True
         ),
         fill=RED
@@ -1666,14 +1668,15 @@ def create_card(
             result["winner_name"]
         )
 
+    # Имя победителя - шрифт увеличен
     draw.text(
         (
             90,
-            result_y + 55
+            result_y + 52
         ),
         winner_text,
         font=get_font(
-            44,
+            48,
             True
         ),
         fill=PURPLE
@@ -1698,14 +1701,15 @@ def create_card(
             "..."
         )
 
+    # Вердикт - шрифт слегка увеличен для лучшей читаемости
     draw.text(
         (
             90,
-            result_y + 120
+            result_y + 122
         ),
         verdict,
         font=get_font(
-            23
+            26
         ),
         fill=WHITE
     )
@@ -1717,11 +1721,11 @@ def create_card(
     draw.text(
         (
             90,
-            H - 55
+            H - 52
         ),
         "MOG AI  •  POWERED BY GEMINI",
         font=get_font(
-            18,
+            20,
             True
         ),
         fill=MUTED
