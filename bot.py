@@ -31,7 +31,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.5-flash"
 ).strip()
 
 DATA_FILE = "mog_data.json"
@@ -46,7 +46,7 @@ DATA_FILE = "mog_data.json"
 # 1.5  = +50%
 # 2.0  = в 2 раза больше
 #
-FONT_SCALE = 1.5
+FONT_SCALE = 2.5
 
 
 if not BOT_TOKEN:
