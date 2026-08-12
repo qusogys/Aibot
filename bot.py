@@ -1143,7 +1143,7 @@ def create_card(
         W // 2,
         35,
         get_font(
-            100,
+            52,
             True
         ),
         WHITE
@@ -1152,7 +1152,7 @@ def create_card(
     text_center(
         "AI PROFILE COMPARISON",
         W // 2,
-        100,
+        22,
         get_font(
             50,
             True
