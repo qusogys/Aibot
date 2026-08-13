@@ -29,18 +29,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-DATA_FILE = "mog_data.json"
-CONFIG_FILE = "mog_config.json"
-
 OWNER_ID = 8904429775
 
-GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
+DATA_FILE = "mog_data.json"
+SETTINGS_FILE = "mog_settings.json"
 
-GEMINI_MAX_RETRIES = 4
+GEMINI_MAX_RETRIES = 3
 GEMINI_TIMEOUT = 120
 
 GEMINI_SEMAPHORE = asyncio.Semaphore(2)
 
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -61,111 +60,20 @@ dp = Dispatcher()
 
 
 # ============================================================
-# GEMINI CONFIG
+# GLOBAL USER STATE
 # ============================================================
 
-def default_config():
-    return {
-        "api_keys": [],
-        "model": GEMINI_DEFAULT_MODEL
-    }
+# Здесь хранится состояние владельца:
+#
+# {
+#   8904429775: "waiting_api_key",
+#   8904429775: "waiting_model"
+# }
+#
+# Это решает проблему:
+# "Отправь API key" -> следующее сообщение ничего не делает.
 
-
-def load_config():
-
-    if not os.path.exists(CONFIG_FILE):
-        return default_config()
-
-    try:
-
-        with open(
-            CONFIG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if not isinstance(data, dict):
-            return default_config()
-
-        data.setdefault("api_keys", [])
-        data.setdefault(
-            "model",
-            GEMINI_DEFAULT_MODEL
-        )
-
-        if not isinstance(
-            data["api_keys"],
-            list
-        ):
-            data["api_keys"] = []
-
-        data["api_keys"] = [
-            str(x).strip()
-            for x in data["api_keys"]
-            if str(x).strip()
-        ]
-
-        return data
-
-    except Exception:
-
-        logger.exception(
-            "Failed to load Gemini config"
-        )
-
-        return default_config()
-
-
-def save_config(config):
-
-    temporary = CONFIG_FILE + ".tmp"
-
-    with open(
-        temporary,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            config,
-            file,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    os.replace(
-        temporary,
-        CONFIG_FILE
-    )
-
-
-def get_api_keys():
-
-    config = load_config()
-
-    return config.get(
-        "api_keys",
-        []
-    )
-
-
-def get_model():
-
-    config = load_config()
-
-    model = str(
-        config.get(
-            "model",
-            GEMINI_DEFAULT_MODEL
-        )
-    ).strip()
-
-    if model.startswith("models/"):
-        model = model[7:]
-
-    return model or GEMINI_DEFAULT_MODEL
+USER_STATES = {}
 
 
 # ============================================================
@@ -190,7 +98,7 @@ CATEGORIES = [
 
 
 # ============================================================
-# FONTS
+# CARD FONT SETTINGS
 # ============================================================
 
 FONT_SIZES = {
@@ -226,14 +134,18 @@ FONT_SIZES = {
 
 BG = "#09090d"
 PANEL = "#111118"
+PANEL_2 = "#17171f"
 BORDER = "#24242d"
 
 WHITE = "#f4f4f7"
 MUTED = "#858591"
 
 YELLOW = "#f4c542"
+PURPLE = "#8b5cf6"
+PURPLE_DARK = "#241a3d"
 
 RED = "#ef3030"
+RED_DARK = "#8b1010"
 
 BAR_BG = "#292932"
 
@@ -252,12 +164,160 @@ class Profile:
         bio,
         avatar
     ):
-
         self.user_id = user_id
         self.username = username
         self.name = name
         self.bio = bio
         self.avatar = avatar
+
+
+# ============================================================
+# SETTINGS DATABASE
+# ============================================================
+
+def default_settings():
+
+    return {
+        "api_keys": [],
+        "model": DEFAULT_MODEL
+    }
+
+
+def load_settings():
+
+    if not os.path.exists(SETTINGS_FILE):
+
+        return default_settings()
+
+    try:
+
+        with open(
+            SETTINGS_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+
+            return default_settings()
+
+        data.setdefault(
+            "api_keys",
+            []
+        )
+
+        data.setdefault(
+            "model",
+            DEFAULT_MODEL
+        )
+
+        if not isinstance(
+            data["api_keys"],
+            list
+        ):
+
+            data["api_keys"] = []
+
+        # Удаляем мусор
+        clean_keys = []
+
+        for key in data["api_keys"]:
+
+            if isinstance(
+                key,
+                str
+            ):
+
+                key = key.strip()
+
+                if key and key not in clean_keys:
+
+                    clean_keys.append(key)
+
+        data["api_keys"] = clean_keys
+
+        return data
+
+    except Exception:
+
+        logger.exception(
+            "Failed to load settings"
+        )
+
+        return default_settings()
+
+
+def save_settings(
+    settings
+):
+
+    temporary_file = (
+        SETTINGS_FILE
+        +
+        ".tmp"
+    )
+
+    try:
+
+        with open(
+            temporary_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                settings,
+                file,
+                ensure_ascii=False,
+                indent=2
+            )
+
+        os.replace(
+            temporary_file,
+            SETTINGS_FILE
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Failed to save settings"
+        )
+
+
+# ============================================================
+# OWNER CHECK
+# ============================================================
+
+def is_owner(
+    user_id
+):
+
+    return int(user_id) == OWNER_ID
+
+
+# ============================================================
+# MASK API KEY
+# ============================================================
+
+def mask_api_key(
+    key
+):
+
+    key = str(key)
+
+    if len(key) <= 12:
+
+        return "*" * len(key)
+
+    return (
+        key[:6]
+        +
+        "..."
+        +
+        key[-6:]
+    )
 
 
 # ============================================================
@@ -283,15 +343,25 @@ def load_data():
 
             data = json.load(file)
 
-        if not isinstance(data, dict):
+        if not isinstance(
+            data,
+            dict
+        ):
 
             return {
                 "users": {},
                 "battles": []
             }
 
-        data.setdefault("users", {})
-        data.setdefault("battles", [])
+        data.setdefault(
+            "users",
+            {}
+        )
+
+        data.setdefault(
+            "battles",
+            []
+        )
 
         return data
 
@@ -307,9 +377,15 @@ def load_data():
         }
 
 
-def save_data(data):
+def save_data(
+    data
+):
 
-    temporary_file = DATA_FILE + ".tmp"
+    temporary_file = (
+        DATA_FILE
+        +
+        ".tmp"
+    )
 
     try:
 
@@ -344,7 +420,9 @@ def ensure_user(
     username
 ):
 
-    user_id = str(user_id)
+    user_id = str(
+        user_id
+    )
 
     if user_id not in data["users"]:
 
@@ -429,11 +507,17 @@ def register_battle(
         "status": result["status"]
     }
 
-    data["battles"].append(battle)
+    data["battles"].append(
+        battle
+    )
 
-    data["battles"] = data["battles"][-500:]
+    data["battles"] = (
+        data["battles"][-500:]
+    )
 
-    save_data(data)
+    save_data(
+        data
+    )
 
 
 # ============================================================
@@ -445,18 +529,22 @@ async def get_profile(
     user_id: int
 ):
 
-    chat = await bot.get_chat(user_id)
+    chat = await bot.get_chat(
+        user_id
+    )
 
     username = (
         "@"
-        + chat.username
+        +
+        chat.username
         if chat.username
         else "no_username"
     )
 
     name = (
         chat.full_name
-        or "Unknown"
+        or
+        "Unknown"
     )
 
     bio = (
@@ -465,7 +553,8 @@ async def get_profile(
             "bio",
             ""
         )
-        or ""
+        or
+        ""
     )
 
     avatar = None
@@ -516,48 +605,37 @@ async def get_profile(
 # ============================================================
 
 GEMINI_RESPONSE_SCHEMA = {
-    "type": "object",
-
+    "type": "OBJECT",
     "properties": {
 
         "players": {
-            "type": "array",
+            "type": "ARRAY",
             "minItems": 2,
             "maxItems": 2,
 
             "items": {
-                "type": "object",
+                "type": "OBJECT",
 
                 "properties": {
 
                     "name": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 10
+                        "type": "NUMBER"
                     },
 
                     "username": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 10
+                        "type": "NUMBER"
                     },
 
                     "bio": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 10
+                        "type": "NUMBER"
                     },
 
                     "coherence": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 10
+                        "type": "NUMBER"
                     },
 
                     "vibe": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 10
+                        "type": "NUMBER"
                     }
                 },
 
@@ -572,7 +650,7 @@ GEMINI_RESPONSE_SCHEMA = {
         },
 
         "verdict": {
-            "type": "string"
+            "type": "STRING"
         }
     },
 
@@ -584,253 +662,10 @@ GEMINI_RESPONSE_SCHEMA = {
 
 
 # ============================================================
-# JSON EXTRACTION
+# GEMINI PROMPT
 # ============================================================
 
-def extract_json(text):
-
-    text = str(text or "").strip()
-
-    if not text:
-        raise RuntimeError(
-            "Gemini JSON parsing failed: empty response."
-        )
-
-    # Direct JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # Markdown code block
-    cleaned = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    cleaned = re.sub(
-        r"\s*```$",
-        "",
-        cleaned
-    )
-
-    cleaned = cleaned.strip()
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Find first balanced JSON object.
-    start = cleaned.find("{")
-
-    if start == -1:
-
-        raise RuntimeError(
-            "Gemini JSON parsing failed: no JSON object."
-        )
-
-    depth = 0
-    in_string = False
-    escaped = False
-
-    for i in range(
-        start,
-        len(cleaned)
-    ):
-
-        char = cleaned[i]
-
-        if in_string:
-
-            if escaped:
-
-                escaped = False
-
-            elif char == "\\":
-
-                escaped = True
-
-            elif char == '"':
-
-                in_string = False
-
-            continue
-
-        if char == '"':
-
-            in_string = True
-
-        elif char == "{":
-
-            depth += 1
-
-        elif char == "}":
-
-            depth -= 1
-
-            if depth == 0:
-
-                candidate = cleaned[
-                    start:i + 1
-                ]
-
-                try:
-
-                    return json.loads(
-                        candidate
-                    )
-
-                except json.JSONDecodeError:
-
-                    break
-
-    raise RuntimeError(
-        "Gemini JSON parsing failed: no valid JSON object."
-    )
-
-
-# ============================================================
-# GEMINI REQUEST
-# ============================================================
-
-async def call_gemini(
-    client,
-    api_key,
-    model,
-    parts
-):
-
-    model = model.strip()
-
-    if model.startswith("models/"):
-        model = model[7:]
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{model}:generateContent"
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": parts
-            }
-        ],
-
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseJsonSchema": GEMINI_RESPONSE_SCHEMA,
-            "temperature": 0.7,
-            "maxOutputTokens": 1200
-        }
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key
-    }
-
-    response = await client.post(
-        url,
-        headers=headers,
-        json=payload
-    )
-
-    if response.status_code != 200:
-
-        error_text = response.text[:2500]
-
-        raise RuntimeError(
-            f"Gemini API error {response.status_code}: "
-            f"{error_text}"
-        )
-
-    try:
-
-        data = response.json()
-
-    except Exception as error:
-
-        raise RuntimeError(
-            "Gemini returned invalid HTTP JSON."
-        ) from error
-
-    candidates = data.get(
-        "candidates",
-        []
-    )
-
-    if not candidates:
-
-        raise RuntimeError(
-            "Gemini returned no candidates."
-        )
-
-    content = candidates[0].get(
-        "content",
-        {}
-    )
-
-    response_parts = content.get(
-        "parts",
-        []
-    )
-
-    text_parts = []
-
-    for part in response_parts:
-
-        if isinstance(
-            part,
-            dict
-        ) and "text" in part:
-
-            text_parts.append(
-                str(part["text"])
-            )
-
-    text = "".join(
-        text_parts
-    ).strip()
-
-    if not text:
-
-        raise RuntimeError(
-            "Gemini returned empty text."
-        )
-
-    return extract_json(text)
-
-
-# ============================================================
-# GEMINI ANALYSIS
-# ============================================================
-
-async def analyze_with_gemini(
-    player1,
-    player2
-):
-
-    config = load_config()
-
-    api_keys = config.get(
-        "api_keys",
-        []
-    )
-
-    model = get_model()
-
-    if not api_keys:
-
-        raise RuntimeError(
-            "Нет Gemini API ключей. "
-            "Открой /настройки и добавь хотя бы один ключ."
-        )
-
-    prompt = """
+GEMINI_PROMPT = """
 Ты — AI-судья юмористической игры MOG BATTLE.
 
 Сравни два Telegram-профиля.
@@ -863,21 +698,38 @@ BIO:
 качество текста, краткость, оригинальность,
 характер и оформление.
 
-Если bio отсутствует, не выдумывай текст.
+Если bio отсутствует,
+не выдумывай текст.
 
 COHERENCE:
-Оцени сочетание NAME + USERNAME + BIO + AVATAR.
+Оцени сочетание:
+NAME + USERNAME + BIO + AVATAR.
 
 VIBE:
 Оцени общий стиль профиля:
 визуальное впечатление, атмосферу,
 цельность, характер и запоминаемость.
 
-Не делай выводы о чувствительных персональных характеристиках.
+Аватар используется только для COHERENCE и VIBE.
+
+Не оценивай и не делай выводы о:
+
+- расе;
+- этничности;
+- религии;
+- политических взглядах;
+- сексуальной ориентации;
+- здоровье;
+- инвалидности;
+- теле;
+- физической привлекательности;
+- точном возрасте;
+- других чувствительных характеристиках.
 
 Не выдумывай информацию.
 
-Используй диапазон 0-10.
+Используй весь диапазон 0-10.
+Не ставь одинаковые оценки без причины.
 
 Сделай короткий смешной русский вердикт,
 максимум 180 символов.
@@ -885,7 +737,313 @@ VIBE:
 Верни ТОЛЬКО JSON.
 """
 
-    def profile_text(profile):
+
+# ============================================================
+# GEMINI API ERROR
+# ============================================================
+
+class GeminiAPIError(
+    RuntimeError
+):
+    pass
+
+
+# ============================================================
+# ONE GEMINI REQUEST
+# ============================================================
+
+async def gemini_request(
+    client,
+    api_key,
+    model,
+    parts
+):
+
+    model = model.strip()
+
+    if model.startswith(
+        "models/"
+    ):
+
+        model = model[
+            len("models/"):
+        ]
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts
+            }
+        ],
+
+        "generationConfig": {
+            "responseMimeType":
+                "application/json",
+
+            "responseJsonSchema":
+                GEMINI_RESPONSE_SCHEMA,
+
+            "temperature": 0.7,
+
+            "maxOutputTokens":
+                1000
+        }
+    }
+
+    headers = {
+        "Content-Type":
+            "application/json",
+
+        "x-goog-api-key":
+            api_key
+    }
+
+    response = await client.post(
+        url,
+        headers=headers,
+        json=payload
+    )
+
+    if response.status_code != 200:
+
+        body = response.text[:2000]
+
+        raise GeminiAPIError(
+            f"Gemini API error {response.status_code}: "
+            f"{body}"
+        )
+
+    try:
+
+        data = response.json()
+
+    except Exception as error:
+
+        raise GeminiAPIError(
+            "Gemini returned invalid HTTP JSON."
+        ) from error
+
+    candidates = data.get(
+        "candidates",
+        []
+    )
+
+    if not candidates:
+
+        raise GeminiAPIError(
+            "Gemini API returned no candidates."
+        )
+
+    candidate = candidates[0]
+
+    content = candidate.get(
+        "content",
+        {}
+    )
+
+    response_parts = content.get(
+        "parts",
+        []
+    )
+
+    text_parts = []
+
+    for part in response_parts:
+
+        text_value = part.get(
+            "text"
+        )
+
+        if text_value:
+
+            text_parts.append(
+                text_value
+            )
+
+    text = "".join(
+        text_parts
+    ).strip()
+
+    if not text:
+
+        finish_reason = candidate.get(
+            "finishReason",
+            "UNKNOWN"
+        )
+
+        raise GeminiAPIError(
+            "Gemini returned empty response. "
+            f"finishReason={finish_reason}"
+        )
+
+    return text
+
+
+# ============================================================
+# PARSE GEMINI JSON
+# ============================================================
+
+def parse_gemini_json(
+    text
+):
+
+    text = str(
+        text or ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # DIRECT
+    # --------------------------------------------------------
+
+    try:
+
+        return json.loads(
+            text
+        )
+
+    except json.JSONDecodeError:
+        pass
+
+    # --------------------------------------------------------
+    # CODE BLOCK
+    # --------------------------------------------------------
+
+    cleaned = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    cleaned = re.sub(
+        r"\s*```$",
+        "",
+        cleaned
+    ).strip()
+
+    try:
+
+        return json.loads(
+            cleaned
+        )
+
+    except json.JSONDecodeError:
+        pass
+
+    # --------------------------------------------------------
+    # FIND OBJECT SAFELY
+    # --------------------------------------------------------
+
+    start = cleaned.find(
+        "{"
+    )
+
+    if start == -1:
+
+        raise RuntimeError(
+            "Gemini JSON parsing failed: no JSON object."
+        )
+
+    depth = 0
+    in_string = False
+    escape = False
+
+    for index in range(
+        start,
+        len(cleaned)
+    ):
+
+        char = cleaned[index]
+
+        if escape:
+
+            escape = False
+            continue
+
+        if char == "\\" and in_string:
+
+            escape = True
+            continue
+
+        if char == '"':
+
+            in_string = not in_string
+            continue
+
+        if in_string:
+            continue
+
+        if char == "{":
+
+            depth += 1
+
+        elif char == "}":
+
+            depth -= 1
+
+            if depth == 0:
+
+                candidate = cleaned[
+                    start:index + 1
+                ]
+
+                try:
+
+                    return json.loads(
+                        candidate
+                    )
+
+                except json.JSONDecodeError:
+                    break
+
+    logger.error(
+        "Gemini invalid JSON: %s",
+        text[:5000]
+    )
+
+    raise RuntimeError(
+        "Gemini JSON parsing failed."
+    )
+
+
+# ============================================================
+# ANALYZE WITH GEMINI
+# ============================================================
+
+async def analyze_with_gemini(
+    player1,
+    player2
+):
+
+    settings = load_settings()
+
+    api_keys = settings.get(
+        "api_keys",
+        []
+    )
+
+    model = settings.get(
+        "model",
+        DEFAULT_MODEL
+    )
+
+    if not api_keys:
+
+        raise RuntimeError(
+            "Нет Gemini API keys. "
+            "Владелец должен открыть /настройки "
+            "и добавить хотя бы один ключ."
+        )
+
+    def profile_text(
+        profile
+    ):
 
         return (
             f"\nUSERNAME: {profile.username}"
@@ -896,40 +1054,55 @@ VIBE:
     parts = [
 
         {
-            "text": prompt
+            "text":
+                GEMINI_PROMPT
         },
 
         {
             "text":
                 "\n\nPLAYER 1"
-                + profile_text(player1)
+                +
+                profile_text(
+                    player1
+                )
         },
 
         {
             "text":
                 "\n\nPLAYER 2"
-                + profile_text(player2)
+                +
+                profile_text(
+                    player2
+                )
         }
     ]
+
+    # --------------------------------------------------------
+    # AVATAR 1
+    # --------------------------------------------------------
 
     if player1.avatar:
 
         parts.append(
             {
-                "text":
-                    "Следующее изображение — аватар PLAYER 1."
+                "inline_data": {
+                    "mime_type":
+                        "image/jpeg",
+
+                    "data":
+                        base64.b64encode(
+                            player1.avatar
+                        ).decode(
+                            "utf-8"
+                        )
+                }
             }
         )
 
         parts.append(
             {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data":
-                        base64.b64encode(
-                            player1.avatar
-                        ).decode("utf-8")
-                }
+                "text":
+                    "Это аватар PLAYER 1."
             }
         )
 
@@ -942,24 +1115,32 @@ VIBE:
             }
         )
 
+    # --------------------------------------------------------
+    # AVATAR 2
+    # --------------------------------------------------------
+
     if player2.avatar:
 
         parts.append(
             {
-                "text":
-                    "Следующее изображение — аватар PLAYER 2."
+                "inline_data": {
+                    "mime_type":
+                        "image/jpeg",
+
+                    "data":
+                        base64.b64encode(
+                            player2.avatar
+                        ).decode(
+                            "utf-8"
+                        )
+                }
             }
         )
 
         parts.append(
             {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data":
-                        base64.b64encode(
-                            player2.avatar
-                        ).decode("utf-8")
-                }
+                "text":
+                    "Это аватар PLAYER 2."
             }
         )
 
@@ -972,17 +1153,17 @@ VIBE:
             }
         )
 
+    # --------------------------------------------------------
+    # TRY KEYS
+    # --------------------------------------------------------
+
+    last_error = None
+
     async with GEMINI_SEMAPHORE:
 
         async with httpx.AsyncClient(
             timeout=GEMINI_TIMEOUT
         ) as client:
-
-            last_error = None
-
-            # =================================================
-            # KEY FAILOVER
-            # =================================================
 
             for key_index, api_key in enumerate(
                 api_keys
@@ -995,23 +1176,27 @@ VIBE:
                     try:
 
                         logger.info(
-                            "Gemini request: key=%s/%s model=%s attempt=%s",
+                            "Gemini request: key %s/%s, model=%s, attempt=%s",
                             key_index + 1,
                             len(api_keys),
                             model,
                             attempt + 1
                         )
 
-                        result = await call_gemini(
+                        text = await gemini_request(
                             client,
                             api_key,
                             model,
                             parts
                         )
 
+                        result = parse_gemini_json(
+                            text
+                        )
+
                         return result
 
-                    except Exception as error:
+                    except GeminiAPIError as error:
 
                         last_error = error
 
@@ -1025,90 +1210,61 @@ VIBE:
                             error_text[:1000]
                         )
 
-                        # -------------------------------------
-                        # KEY SHOULD BE SKIPPED
-                        # -------------------------------------
+                        # ------------------------------------------------
+                        # INVALID MODEL / INVALID KEY / PERMISSION /
+                        # QUOTA / RATE LIMIT:
+                        # сразу пробуем следующий ключ.
+                        # ------------------------------------------------
 
-                        lower = error_text.lower()
-
-                        permanent_key_error = (
-                            "401" in lower
+                        if (
+                            "400" in error_text
                             or
-                            "403" in lower
+                            "401" in error_text
                             or
-                            "api key" in lower
+                            "403" in error_text
                             or
-                            "permission" in lower
+                            "404" in error_text
                             or
-                            "quota" in lower
-                            or
-                            "resource_exhausted" in lower
-                        )
-
-                        if permanent_key_error:
-
-                            logger.warning(
-                                "Switching to next Gemini API key."
-                            )
+                            "429" in error_text
+                        ):
 
                             break
 
-                        # -------------------------------------
-                        # MODEL ERROR
-                        # -------------------------------------
-
-                        if (
-                            "model" in lower
-                            and
-                            (
-                                "not found" in lower
-                                or
-                                "unavailable" in lower
-                            )
-                        ):
-
-                            raise RuntimeError(
-                                f"Gemini API error: {error_text}"
-                            )
-
-                        # -------------------------------------
-                        # JSON ERROR
-                        # -------------------------------------
-
-                        if (
-                            "json parsing failed" in lower
-                            or
-                            "empty text" in lower
-                        ):
-
-                            if attempt >= 1:
-
-                                break
-
-                        # -------------------------------------
-                        # RETRY
-                        # -------------------------------------
-
                         if attempt < GEMINI_MAX_RETRIES - 1:
 
-                            delay = min(
-                                3 * (2 ** attempt),
-                                20
+                            await asyncio.sleep(
+                                2 ** attempt
                             )
+
+                    except Exception as error:
+
+                        last_error = error
+
+                        logger.warning(
+                            "Gemini parsing/request error: %s",
+                            error
+                        )
+
+                        # Ошибка JSON может быть временной.
+                        if attempt < GEMINI_MAX_RETRIES - 1:
 
                             await asyncio.sleep(
-                                delay
+                                2 ** attempt
                             )
 
-            if last_error:
+                        else:
 
-                raise RuntimeError(
-                    f"Gemini API error: {last_error}"
-                )
+                            break
 
-            raise RuntimeError(
-                "All Gemini API keys failed."
-            )
+    if last_error:
+
+        raise RuntimeError(
+            f"Gemini API error: {last_error}"
+        )
+
+    raise RuntimeError(
+        "Gemini request failed."
+    )
 
 
 # ============================================================
@@ -1179,7 +1335,10 @@ def calculate_scores(
             scores[key] = value
 
         overall = sum(
-            scores[key] * WEIGHTS[key]
+            scores[key]
+            *
+            WEIGHTS[key]
+
             for key in WEIGHTS
         )
 
@@ -1188,7 +1347,9 @@ def calculate_scores(
             2
         )
 
-        players.append(scores)
+        players.append(
+            scores
+        )
 
     score1 = players[0]["overall"]
     score2 = players[1]["overall"]
@@ -1211,13 +1372,16 @@ def calculate_scores(
         winner = 0
         loser = 1
 
-        if difference >= 2:
+        if difference >= 2.0:
+
             status = "ABSOLUTE MOG"
 
-        elif difference >= 1:
+        elif difference >= 1.0:
+
             status = "DOMINATED"
 
         else:
+
             status = "MOGGED"
 
     else:
@@ -1225,13 +1389,16 @@ def calculate_scores(
         winner = 1
         loser = 0
 
-        if difference >= 2:
+        if difference >= 2.0:
+
             status = "ABSOLUTE MOG"
 
-        elif difference >= 1:
+        elif difference >= 1.0:
+
             status = "DOMINATED"
 
         else:
+
             status = "MOGGED"
 
     winner_name = (
@@ -1241,18 +1408,31 @@ def calculate_scores(
     )
 
     return {
-        "players": players,
-        "winner": winner,
-        "loser": loser,
-        "winner_name": winner_name,
-        "difference": difference,
-        "status": status,
-        "verdict": str(
-            ai_result.get(
-                "verdict",
-                "Нет вердикта."
-            )
-        )[:300]
+        "players":
+            players,
+
+        "winner":
+            winner,
+
+        "loser":
+            loser,
+
+        "winner_name":
+            winner_name,
+
+        "difference":
+            difference,
+
+        "status":
+            status,
+
+        "verdict":
+            str(
+                ai_result.get(
+                    "verdict",
+                    "Нет вердикта."
+                )
+            )[:300]
     }
 
 
@@ -1274,9 +1454,14 @@ def get_font(
     )
 
     if cache_key in _FONT_CACHE:
-        return _FONT_CACHE[cache_key]
 
-    size = FONT_SIZES[key]
+        return _FONT_CACHE[
+            cache_key
+        ]
+
+    size = FONT_SIZES[
+        key
+    ]
 
     if bold:
 
@@ -1303,13 +1488,17 @@ def get_font(
                 int(size)
             )
 
-            _FONT_CACHE[cache_key] = font_obj
+            _FONT_CACHE[
+                cache_key
+            ] = font_obj
 
             return font_obj
 
     font_obj = ImageFont.load_default()
 
-    _FONT_CACHE[cache_key] = font_obj
+    _FONT_CACHE[
+        cache_key
+    ] = font_obj
 
     return font_obj
 
@@ -1339,11 +1528,15 @@ def truncate_text(
     )
 
     if len(text) <= max_chars:
+
         return text
 
     return (
-        text[:max_chars - 1]
-        + "…"
+        text[
+            :max_chars - 1
+        ]
+        +
+        "…"
     )
 
 
@@ -1384,11 +1577,13 @@ def wrap_text(
     max_width
 ):
 
-    words = str(
-        text or ""
-    ).split()
+    words = (
+        str(text or "")
+        .split()
+    )
 
     if not words:
+
         return [""]
 
     lines = []
@@ -1399,7 +1594,12 @@ def wrap_text(
         candidate = (
             word
             if not current
-            else current + " " + word
+            else
+            current
+            +
+            " "
+            +
+            word
         )
 
         bbox = draw.textbbox(
@@ -1419,12 +1619,18 @@ def wrap_text(
         else:
 
             if current:
-                lines.append(current)
+
+                lines.append(
+                    current
+                )
 
             current = word
 
     if current:
-        lines.append(current)
+
+        lines.append(
+            current
+        )
 
     return lines
 
@@ -1440,8 +1646,16 @@ def make_avatar(
 
     result = Image.new(
         "RGBA",
-        (size, size),
-        (0, 0, 0, 0)
+        (
+            size,
+            size
+        ),
+        (
+            0,
+            0,
+            0,
+            0
+        )
     )
 
     if data:
@@ -1450,9 +1664,13 @@ def make_avatar(
 
             avatar = Image.open(
                 io.BytesIO(data)
-            ).convert("RGB")
+            ).convert(
+                "RGB"
+            )
 
-            width, height = avatar.size
+            width, height = (
+                avatar.size
+            )
 
             side = min(
                 width,
@@ -1477,7 +1695,10 @@ def make_avatar(
             )
 
             avatar = avatar.resize(
-                (size, size),
+                (
+                    size,
+                    size
+                ),
                 Image.Resampling.LANCZOS
             )
 
@@ -1485,7 +1706,10 @@ def make_avatar(
 
             avatar = Image.new(
                 "RGB",
-                (size, size),
+                (
+                    size,
+                    size
+                ),
                 "#26262f"
             )
 
@@ -1493,17 +1717,25 @@ def make_avatar(
 
         avatar = Image.new(
             "RGB",
-            (size, size),
+            (
+                size,
+                size
+            ),
             "#26262f"
         )
 
     mask = Image.new(
         "L",
-        (size, size),
+        (
+            size,
+            size
+        ),
         0
     )
 
-    mask_draw = ImageDraw.Draw(mask)
+    mask_draw = ImageDraw.Draw(
+        mask
+    )
 
     mask_draw.ellipse(
         (
@@ -1517,11 +1749,16 @@ def make_avatar(
 
     result.paste(
         avatar,
-        (0, 0),
+        (
+            0,
+            0
+        ),
         mask
     )
 
-    border = ImageDraw.Draw(result)
+    border = ImageDraw.Draw(
+        result
+    )
 
     border.ellipse(
         (
@@ -1548,13 +1785,34 @@ def draw_crown(
 ):
 
     points = [
-        (center_x - 80, y + 50),
-        (center_x - 65, y - 15),
-        (center_x - 22, y + 22),
-        (center_x, y - 30),
-        (center_x + 22, y + 22),
-        (center_x + 65, y - 15),
-        (center_x + 80, y + 50)
+        (
+            center_x - 80,
+            y + 50
+        ),
+        (
+            center_x - 65,
+            y - 15
+        ),
+        (
+            center_x - 22,
+            y + 22
+        ),
+        (
+            center_x,
+            y - 30
+        ),
+        (
+            center_x + 22,
+            y + 22
+        ),
+        (
+            center_x + 65,
+            y - 15
+        ),
+        (
+            center_x + 80,
+            y + 50
+        )
     ]
 
     draw.polygon(
@@ -1592,6 +1850,7 @@ def draw_profile_header(
 
     panel_left = 70
     panel_right = W - 70
+
     panel_h = 490
 
     draw.rounded_rectangle(
@@ -1624,22 +1883,28 @@ def draw_profile_header(
 
     avatar_x = (
         center_x
-        - avatar_size // 2
+        -
+        avatar_size // 2
     )
 
     avatar_y = y + 50
 
     image.paste(
         avatar,
-        (avatar_x, avatar_y),
+        (
+            avatar_x,
+            avatar_y
+        ),
         avatar
     )
 
-    label = (
-        "HOST PROFILE"
-        if player_index == 0
-        else "GUEST PROFILE"
-    )
+    if player_index == 0:
+
+        label = "HOST PROFILE"
+
+    else:
+
+        label = "GUEST PROFILE"
 
     label_font = f(
         "profile_label",
@@ -1651,7 +1916,8 @@ def draw_profile_header(
 
     label_x = (
         center_x
-        - label_box_w // 2
+        -
+        label_box_w // 2
     )
 
     label_y = y + 330
@@ -1698,7 +1964,10 @@ def draw_profile_header(
         name,
         center_x,
         y + 395,
-        f("profile_name", True),
+        f(
+            "profile_name",
+            True
+        ),
         WHITE
     )
 
@@ -1712,7 +1981,10 @@ def draw_profile_header(
         username,
         center_x,
         y + 445,
-        f("profile_username", True),
+        f(
+            "profile_username",
+            True
+        ),
         YELLOW
     )
 
@@ -1784,8 +2056,10 @@ def draw_score_panel(
 
         badge_x = (
             panel_right
-            - badge_w
-            - 38
+            -
+            badge_w
+            -
+            38
         )
 
         badge_y = y + 27
@@ -1814,6 +2088,7 @@ def draw_score_panel(
         )
 
     label_x = panel_left + 38
+
     bar_x = 300
     bar_width = 550
     score_x = 885
@@ -1824,11 +2099,14 @@ def draw_score_panel(
     for index, (
         label,
         key
-    ) in enumerate(CATEGORIES):
+    ) in enumerate(
+        CATEGORIES
+    ):
 
         row_y = (
             first_y
-            + index * row_gap
+            +
+            index * row_gap
         )
 
         score = result[
@@ -1864,8 +2142,10 @@ def draw_score_panel(
 
         fill_w = (
             bar_width
-            * score
-            / 10
+            *
+            score
+            /
+            10
         )
 
         if fill_w > 0:
@@ -1956,7 +2236,7 @@ def draw_vs(
 
 
 # ============================================================
-# STAMP
+# MOGGED STAMP
 # ============================================================
 
 def create_mogged_stamp():
@@ -1966,11 +2246,21 @@ def create_mogged_stamp():
 
     stamp = Image.new(
         "RGBA",
-        (width, height),
-        (0, 0, 0, 0)
+        (
+            width,
+            height
+        ),
+        (
+            0,
+            0,
+            0,
+            0
+        )
     )
 
-    draw = ImageDraw.Draw(stamp)
+    draw = ImageDraw.Draw(
+        stamp
+    )
 
     draw.rounded_rectangle(
         (
@@ -2019,11 +2309,16 @@ def create_card(
 
     image = Image.new(
         "RGB",
-        (W, H),
+        (
+            W,
+            H
+        ),
         BG
     )
 
-    draw = ImageDraw.Draw(image)
+    draw = ImageDraw.Draw(
+        image
+    )
 
     center_x = W // 2
 
@@ -2051,34 +2346,26 @@ def create_card(
         MUTED
     )
 
-    player1_profile_y = 150
-
     draw_profile_header(
         image,
         draw,
         player1,
         result,
         0,
-        player1_profile_y
+        150
     )
-
-    player1_score_y = 670
 
     draw_score_panel(
         draw,
         result,
         0,
-        player1_score_y
+        670
     )
-
-    vs_y = 1280
 
     draw_vs(
         draw,
-        vs_y
+        1280
     )
-
-    player2_profile_y = 1415
 
     draw_profile_header(
         image,
@@ -2086,16 +2373,14 @@ def create_card(
         player2,
         result,
         1,
-        player2_profile_y
+        1415
     )
-
-    player2_score_y = 1935
 
     draw_score_panel(
         draw,
         result,
         1,
-        player2_score_y
+        1935
     )
 
     if result["loser"] is not None:
@@ -2104,14 +2389,18 @@ def create_card(
 
         stamp_x = (
             center_x
-            - stamp.width // 2
+            -
+            stamp.width // 2
         )
 
         stamp_y = 2145
 
         image.paste(
             stamp,
-            (stamp_x, stamp_y),
+            (
+                stamp_x,
+                stamp_y
+            ),
             stamp
         )
 
@@ -2149,7 +2438,8 @@ def create_card(
 
         winner_text = (
             "WINNER  "
-            + result["winner_name"]
+            +
+            result["winner_name"]
         )
 
     draw_center(
@@ -2191,9 +2481,11 @@ def create_card(
     )
 
     verdict = truncate_text(
-        result.get(
-            "verdict",
-            ""
+        str(
+            result.get(
+                "verdict",
+                ""
+            )
         ).strip(),
         150
     )
@@ -2208,7 +2500,11 @@ def create_card(
         W - 130
     )
 
-    verdict_y = result_y + 175
+    verdict_y = (
+        result_y
+        +
+        175
+    )
 
     for line in verdict_lines[:2]:
 
@@ -2250,7 +2546,7 @@ def create_card(
 
 
 # ============================================================
-# KEYBOARD
+# RESULT KEYBOARD
 # ============================================================
 
 def result_keyboard(
@@ -2274,413 +2570,16 @@ def result_keyboard(
         callback_data="details"
     )
 
-    builder.adjust(1)
+    builder.adjust(
+        1,
+        1
+    )
 
     return builder.as_markup()
 
 
 # ============================================================
-# RESOLVE TARGET
-# ============================================================
-
-async def resolve_target(
-    message: Message,
-    bot: Bot
-):
-
-    # Reply
-    if (
-        message.reply_to_message
-        and
-        message.reply_to_message.from_user
-    ):
-
-        return (
-            message.from_user.id,
-            message.reply_to_message.from_user.id
-        )
-
-    text = (
-        message.text
-        or
-        message.caption
-        or
-        ""
-    ).strip()
-
-    # .мог / .мог @username
-    match = re.match(
-        r"^\.мог(?:\s+@([A-Za-z0-9_]{5,32}))?\s*$",
-        text,
-        re.IGNORECASE
-    )
-
-    if match:
-
-        username = match.group(1)
-
-        if username:
-
-            try:
-
-                target = await bot.get_chat(
-                    "@" + username
-                )
-
-                return (
-                    message.from_user.id,
-                    target.id
-                )
-
-            except Exception as error:
-
-                logger.warning(
-                    "Username lookup failed: %s",
-                    error
-                )
-
-                return None
-
-        return None
-
-    # /mog /mog@bot /mog @username
-    match = re.match(
-        r"^/mog(?:@[A-Za-z0-9_]+)?(?:\s+@([A-Za-z0-9_]{5,32}))?\s*$",
-        text,
-        re.IGNORECASE
-    )
-
-    if match:
-
-        username = match.group(1)
-
-        if username:
-
-            try:
-
-                target = await bot.get_chat(
-                    "@" + username
-                )
-
-                return (
-                    message.from_user.id,
-                    target.id
-                )
-
-            except Exception as error:
-
-                logger.warning(
-                    "Username lookup failed: %s",
-                    error
-                )
-
-        return (
-            message.from_user.id,
-            None
-        )
-
-    return None
-
-
-# ============================================================
-# RUN MOG
-# ============================================================
-
-async def run_mog(
-    message: Message,
-    bot: Bot,
-    player1_id: int,
-    player2_id: int
-):
-
-    if player1_id == player2_id:
-
-        await message.answer(
-            "😐 Себя с собой сравнивать нельзя."
-        )
-
-        return
-
-    status_message = await message.answer(
-        "⚔️ <b>MOG BATTLE</b>\n\n"
-        "🔎 Получаю профили...\n"
-        "🖼 Загружаю аватары...\n"
-        "👤 NAME...\n"
-        "🔤 USERNAME...\n"
-        "📝 BIO...\n"
-        "🔗 COHERENCE...\n"
-        "✨ VIBE...\n"
-        "🧠 Gemini считает оценки..."
-    )
-
-    try:
-
-        player1 = await get_profile(
-            bot,
-            player1_id
-        )
-
-        player2 = await get_profile(
-            bot,
-            player2_id
-        )
-
-        ai_result = await analyze_with_gemini(
-            player1,
-            player2
-        )
-
-        result = calculate_scores(
-            ai_result,
-            [
-                player1.username,
-                player2.username
-            ]
-        )
-
-        register_battle(
-            player1,
-            player2,
-            result
-        )
-
-        card = create_card(
-            player1,
-            player2,
-            result
-        )
-
-        score1 = result[
-            "players"
-        ][0]["overall"]
-
-        score2 = result[
-            "players"
-        ][1]["overall"]
-
-        if result["winner"] is None:
-
-            winner_text = "🤝 <b>DRAW</b>"
-
-        else:
-
-            winner_text = (
-                "👑 <b>"
-                + html.escape(
-                    result["winner_name"]
-                )
-                + "</b>"
-            )
-
-        caption = (
-            "⚔️ <b>MOG BATTLE</b>\n\n"
-            f"{html.escape(player1.username)} "
-            f"<b>{score1:.2f}/10</b>\n"
-            f"{html.escape(player2.username)} "
-            f"<b>{score2:.2f}/10</b>\n\n"
-            f"{winner_text}\n"
-            f"📊 Difference: "
-            f"<b>{result['difference']:.2f}</b>\n\n"
-            f"💬 "
-            f"{html.escape(result['verdict'])}"
-        )
-
-        await message.answer_photo(
-            BufferedInputFile(
-                card,
-                filename="mog_battle.png"
-            ),
-            caption=caption,
-            reply_markup=result_keyboard(
-                player1_id,
-                player2_id
-            )
-        )
-
-        try:
-
-            await status_message.delete()
-
-        except Exception:
-
-            pass
-
-    except Exception as error:
-
-        logger.exception(
-            "MOG failed"
-        )
-
-        error_text = str(error)
-
-        if len(error_text) > 1500:
-            error_text = (
-                error_text[:1500]
-                + "..."
-            )
-
-        try:
-
-            await status_message.edit_text(
-                "❌ <b>MOG FAILED</b>\n\n"
-                "<code>"
-                + html.escape(error_text)
-                + "</code>"
-            )
-
-        except Exception:
-
-            await message.answer(
-                "❌ <b>MOG FAILED</b>\n\n"
-                "<code>"
-                + html.escape(error_text)
-                + "</code>"
-            )
-
-
-# ============================================================
-# IMPORTANT:
-# .мог IS HANDLED HERE
-#
-# Не используем F.text.regexp для .мог.
-# Сначала обычный F.text, затем ручной parser.
-# ============================================================
-
-@dp.message(
-    F.text
-)
-async def all_text_handler(
-    message: Message,
-    bot: Bot
-):
-
-    text = (
-        message.text
-        or
-        ""
-    ).strip()
-
-    lower = text.lower()
-
-    # --------------------------------------------------------
-    # SETTINGS
-    # --------------------------------------------------------
-
-    if lower in (
-        "/настройки",
-        "/settings",
-        ".настройки",
-        ".settings"
-    ):
-
-        await settings_command(
-            message
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # .мог
-    # --------------------------------------------------------
-
-    if re.match(
-        r"^\.мог(?:\s+@[A-Za-z0-9_]{5,32})?\s*$",
-        text,
-        re.IGNORECASE
-    ):
-
-        target = await resolve_target(
-            message,
-            bot
-        )
-
-        if not target:
-
-            await message.answer(
-                "<b>⚔️ MOG AI</b>\n\n"
-                "Чтобы сравнить профиль, "
-                "ответь на сообщение человека "
-                "и напиши:\n\n"
-                "<code>.мог</code>\n\n"
-                "Или:\n"
-                "<code>.мог @username</code>"
-            )
-
-            return
-
-        player1_id, player2_id = target
-
-        if player2_id is None:
-
-            await message.answer(
-                "❌ Не удалось найти пользователя.\n\n"
-                "Ответь на его сообщение и напиши "
-                "<code>.мог</code>."
-            )
-
-            return
-
-        await run_mog(
-            message,
-            bot,
-            player1_id,
-            player2_id
-        )
-
-        return
-
-
-# ============================================================
-# /mog
-# ============================================================
-
-@dp.message(
-    Command("mog")
-)
-async def mog_command(
-    message: Message,
-    bot: Bot
-):
-
-    target = await resolve_target(
-        message,
-        bot
-    )
-
-    if not target:
-
-        await message.answer(
-            "<b>⚔️ MOG AI</b>\n\n"
-            "Использование:\n\n"
-            "1️⃣ Ответь на сообщение человека:\n"
-            "<code>/mog</code>\n\n"
-            "2️⃣ Или:\n"
-            "<code>/mog @username</code>"
-        )
-
-        return
-
-    player1_id, player2_id = target
-
-    if player2_id is None:
-
-        await message.answer(
-            "❌ Укажи username или ответь "
-            "на сообщение пользователя."
-        )
-
-        return
-
-    await run_mog(
-        message,
-        bot,
-        player1_id,
-        player2_id
-    )
-
-
-# ============================================================
-# SETTINGS UI
+# SETTINGS KEYBOARD
 # ============================================================
 
 def settings_keyboard():
@@ -2693,13 +2592,13 @@ def settings_keyboard():
     )
 
     builder.button(
-        text="🗑 Удалить API key",
-        callback_data="settings:remove_key"
+        text="📋 Список API keys",
+        callback_data="settings:list_keys"
     )
 
     builder.button(
-        text="🔑 Список ключей",
-        callback_data="settings:list_keys"
+        text="🗑 Удалить API key",
+        callback_data="settings:delete_key"
     )
 
     builder.button(
@@ -2708,81 +2607,101 @@ def settings_keyboard():
     )
 
     builder.button(
-        text="🔎 Доступные модели",
-        callback_data="settings:models"
-    )
-
-    builder.button(
         text="🧪 Проверить ключи",
         callback_data="settings:test"
     )
 
+    builder.button(
+        text="❌ Закрыть",
+        callback_data="settings:close"
+    )
+
     builder.adjust(
+        1,
+        1,
+        1,
+        1,
+        1,
         1
     )
 
     return builder.as_markup()
 
 
+# ============================================================
+# SETTINGS TEXT
+# ============================================================
+
 def settings_text():
 
-    config = load_config()
+    settings = load_settings()
 
-    keys = config.get(
+    keys = settings.get(
         "api_keys",
         []
     )
 
-    model = get_model()
+    model = settings.get(
+        "model",
+        DEFAULT_MODEL
+    )
 
-    masked = []
+    if keys:
 
-    for index, key in enumerate(keys):
-
-        if len(key) <= 10:
-
-            value = "***"
-
-        else:
-
-            value = (
-                key[:6]
-                + "..."
-                + key[-4:]
-            )
-
-        masked.append(
-            f"{index + 1}. <code>{html.escape(value)}</code>"
+        key_text = (
+            f"🔑 API keys: <b>{len(keys)}</b>"
         )
 
-    keys_text = (
-        "\n".join(masked)
-        if masked
-        else "Нет API ключей."
-    )
+    else:
+
+        key_text = (
+            "🔑 API keys: <b>0</b>"
+        )
 
     return (
-        "<b>⚙️ MOG AI SETTINGS</b>\n\n"
-        f"🤖 Model:\n"
+        "<b>⚙️ MOG AI — НАСТРОЙКИ</b>\n\n"
+
+        f"{key_text}\n"
+
+        f"🤖 Модель: "
         f"<code>{html.escape(model)}</code>\n\n"
-        f"🔑 API keys: <b>{len(keys)}</b>\n"
-        f"{keys_text}\n\n"
-        "Добавь несколько ключей — "
-        "при ошибке/лимите бот попробует следующий."
+
+        "Здесь можно настроить Gemini "
+        "глобально для всего бота.\n\n"
+
+        "Если один API key перестанет работать, "
+        "бот автоматически попробует следующий."
     )
 
 
+# ============================================================
+# SETTINGS COMMAND
+# ============================================================
+
+@dp.message(
+    F.text.regexp(
+        r"^(?:\.настройки|/настройки|/settings)$",
+        flags=re.IGNORECASE
+    )
+)
 async def settings_command(
     message: Message
 ):
 
-    if message.from_user.id != OWNER_ID:
+    if not is_owner(
+        message.from_user.id
+    ):
 
         await message.answer(
-            "⛔ Настройки доступны только владельцу бота."
+            "⛔ У тебя нет доступа к настройкам."
         )
 
         return
+
+    USER_STATES.pop(
+        message.from_user.id,
+        None
+    )
 
     await message.answer(
         settings_text(),
@@ -2791,49 +2710,21 @@ async def settings_command(
 
 
 # ============================================================
-# /настройки
-# ============================================================
-
-@dp.message(
-    Command("настройки")
-)
-async def settings_command_ru(
-    message: Message
-):
-
-    await settings_command(
-        message
-    )
-
-
-# ============================================================
-# /settings
-# ============================================================
-
-@dp.message(
-    Command("settings")
-)
-async def settings_command_en(
-    message: Message
-):
-
-    await settings_command(
-        message
-    )
-
-
-# ============================================================
 # SETTINGS CALLBACK
 # ============================================================
 
 @dp.callback_query(
-    F.data.startswith("settings:")
+    F.data.startswith(
+        "settings:"
+    )
 )
 async def settings_callback(
     callback: CallbackQuery
 ):
 
-    if callback.from_user.id != OWNER_ID:
+    if not is_owner(
+        callback.from_user.id
+    ):
 
         await callback.answer(
             "⛔ Нет доступа.",
@@ -2847,25 +2738,101 @@ async def settings_callback(
         1
     )[1]
 
+    user_id = callback.from_user.id
+
+    # --------------------------------------------------------
+    # ADD KEY
+    # --------------------------------------------------------
+
     if action == "add_key":
 
-        await callback.message.answer(
-            "🔑 <b>Добавление API key</b>\n\n"
-            "Отправь следующим сообщением "
-            "только Gemini API key.\n\n"
-            "Например:\n"
-            "<code>AIza...</code>"
+        USER_STATES[user_id] = (
+            "waiting_api_key"
         )
 
         await callback.answer()
 
+        await callback.message.answer(
+            "🔑 <b>Добавление API key</b>\n\n"
+
+            "Отправь следующим сообщением "
+            "<b>только Gemini API key</b>.\n\n"
+
+            "Например:\n"
+            "<code>AIza...</code>\n\n"
+
+            "❗ После отправки ключ будет сохранён "
+            "глобально для всего бота.\n\n"
+
+            "Для отмены отправь:\n"
+            "<code>отмена</code>"
+        )
+
         return
 
-    if action == "remove_key":
+    # --------------------------------------------------------
+    # LIST KEYS
+    # --------------------------------------------------------
 
-        config = load_config()
+    if action == "list_keys":
 
-        keys = config.get(
+        settings = load_settings()
+
+        keys = settings.get(
+            "api_keys",
+            []
+        )
+
+        if not keys:
+
+            text = (
+                "📋 <b>API KEYS</b>\n\n"
+                "Ключей пока нет."
+            )
+
+        else:
+
+            lines = []
+
+            for index, key in enumerate(
+                keys,
+                1
+            ):
+
+                lines.append(
+                    f"{index}. "
+                    f"<code>{html.escape(mask_api_key(key))}</code>"
+                )
+
+            text = (
+                "📋 <b>API KEYS</b>\n\n"
+                +
+                "\n".join(lines)
+                +
+                "\n\n"
+                +
+                f"🤖 Model: "
+                f"<code>{html.escape(settings.get('model', DEFAULT_MODEL))}</code>"
+            )
+
+        await callback.answer()
+
+        await callback.message.answer(
+            text,
+            reply_markup=settings_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DELETE KEY
+    # --------------------------------------------------------
+
+    if action == "delete_key":
+
+        settings = load_settings()
+
+        keys = settings.get(
             "api_keys",
             []
         )
@@ -2879,92 +2846,324 @@ async def settings_callback(
 
             return
 
-        text = (
-            "<b>🗑 Удаление ключа</b>\n\n"
-        )
+        builder = InlineKeyboardBuilder()
 
-        for index, key in enumerate(keys):
+        for index, key in enumerate(
+            keys
+        ):
 
-            masked = (
-                key[:6]
-                + "..."
-                + key[-4:]
+            builder.button(
+                text=(
+                    f"🗑 {index + 1}. "
+                    f"{mask_api_key(key)}"
+                ),
+                callback_data=(
+                    f"settings:delete:{index}"
+                )
             )
 
-            text += (
-                f"{index + 1}. "
-                f"<code>{html.escape(masked)}</code>\n"
-            )
-
-        text += (
-            "\nНапиши номер ключа, "
-            "который нужно удалить."
+        builder.button(
+            text="⬅️ Назад",
+            callback_data="settings:back"
         )
 
-        await callback.message.answer(
-            text
+        builder.adjust(
+            1
         )
 
         await callback.answer()
 
-        return
-
-    if action == "list_keys":
-
         await callback.message.answer(
-            settings_text()
+            "<b>🗑 Удаление API key</b>\n\n"
+            "Выбери ключ:",
+            reply_markup=builder.as_markup()
         )
 
-        await callback.answer()
-
         return
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
 
     if action == "model":
 
-        await callback.message.answer(
-            "🤖 <b>Изменение модели</b>\n\n"
-            "Отправь название модели.\n\n"
-            "Например:\n"
-            "<code>gemini-3.5-flash</code>\n\n"
-            "Можно также использовать:\n"
-            "<code>gemini-3.1-flash-lite</code>"
+        USER_STATES[user_id] = (
+            "waiting_model"
+        )
+
+        settings = load_settings()
+
+        current_model = settings.get(
+            "model",
+            DEFAULT_MODEL
         )
 
         await callback.answer()
 
-        return
+        await callback.message.answer(
+            "🤖 <b>Изменение модели</b>\n\n"
 
-    if action == "models":
+            "Текущая модель:\n"
+            f"<code>{html.escape(current_model)}</code>\n\n"
 
-        await callback.answer(
-            "Получаю модели..."
+            "Отправь название новой модели.\n\n"
+
+            "Например:\n"
+            "<code>gemini-2.5-flash</code>\n\n"
+
+            "Также можно отправить:\n"
+            "<code>gemini-3.6-flash</code>\n\n"
+
+            "Для отмены:\n"
+            "<code>отмена</code>"
         )
 
-        await send_available_models(
-            callback.message
-        )
-
         return
+
+    # --------------------------------------------------------
+    # TEST
+    # --------------------------------------------------------
 
     if action == "test":
 
         await callback.answer(
-            "Проверяю..."
+            "🧪 Проверяю ключи..."
         )
 
-        await test_all_keys(
-            callback.message
+        settings = load_settings()
+
+        keys = settings.get(
+            "api_keys",
+            []
         )
+
+        model = settings.get(
+            "model",
+            DEFAULT_MODEL
+        )
+
+        if not keys:
+
+            await callback.message.answer(
+                "❌ Нет API keys."
+            )
+
+            return
+
+        results = []
+
+        async with httpx.AsyncClient(
+            timeout=30
+        ) as client:
+
+            for index, key in enumerate(
+                keys,
+                1
+            ):
+
+                try:
+
+                    url = (
+                        "https://generativelanguage.googleapis.com/"
+                        f"v1beta/models/{model}:generateContent"
+                    )
+
+                    payload = {
+                        "contents": [
+                            {
+                                "parts": [
+                                    {
+                                        "text":
+                                            "Reply only with OK."
+                                    }
+                                ]
+                            }
+                        ],
+
+                        "generationConfig": {
+                            "maxOutputTokens": 10
+                        }
+                    }
+
+                    response = await client.post(
+                        url,
+                        headers={
+                            "Content-Type":
+                                "application/json",
+
+                            "x-goog-api-key":
+                                key
+                        },
+                        json=payload
+                    )
+
+                    if response.status_code == 200:
+
+                        results.append(
+                            f"✅ Key {index}: работает"
+                        )
+
+                    else:
+
+                        results.append(
+                            f"❌ Key {index}: "
+                            f"HTTP {response.status_code}"
+                        )
+
+                except Exception as error:
+
+                    results.append(
+                        f"❌ Key {index}: "
+                        f"{str(error)[:100]}"
+                    )
+
+        await callback.message.answer(
+            "<b>🧪 ПРОВЕРКА GEMINI</b>\n\n"
+            +
+            "\n".join(results)
+            +
+            "\n\n"
+            f"🤖 Model: "
+            f"<code>{html.escape(model)}</code>"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DELETE ONE KEY
+    # --------------------------------------------------------
+
+    if action.startswith(
+        "delete"
+    ):
+
+        parts = action.split(
+            ":"
+        )
+
+        if len(parts) != 2:
+
+            await callback.answer(
+                "Ошибка.",
+                show_alert=True
+            )
+
+            return
+
+        try:
+
+            index = int(
+                parts[1]
+            )
+
+        except ValueError:
+
+            await callback.answer(
+                "Ошибка.",
+                show_alert=True
+            )
+
+            return
+
+        settings = load_settings()
+
+        keys = settings.get(
+            "api_keys",
+            []
+        )
+
+        if (
+            index < 0
+            or
+            index >= len(keys)
+        ):
+
+            await callback.answer(
+                "Ключ уже отсутствует.",
+                show_alert=True
+            )
+
+            return
+
+        deleted = keys.pop(
+            index
+        )
+
+        settings["api_keys"] = keys
+
+        save_settings(
+            settings
+        )
+
+        USER_STATES.pop(
+            user_id,
+            None
+        )
+
+        await callback.answer(
+            "Ключ удалён."
+        )
+
+        await callback.message.answer(
+            "🗑 API key удалён:\n"
+            f"<code>{html.escape(mask_api_key(deleted))}</code>\n\n"
+            +
+            settings_text(),
+            reply_markup=settings_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # BACK
+    # --------------------------------------------------------
+
+    if action == "back":
+
+        USER_STATES.pop(
+            user_id,
+            None
+        )
+
+        await callback.answer()
+
+        await callback.message.answer(
+            settings_text(),
+            reply_markup=settings_keyboard()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    if action == "close":
+
+        USER_STATES.pop(
+            user_id,
+            None
+        )
+
+        await callback.answer(
+            "Настройки закрыты."
+        )
+
+        try:
+
+            await callback.message.delete()
+
+        except Exception:
+
+            pass
 
         return
 
 
 # ============================================================
-# SETTINGS INPUT MODE
+# SETTINGS INPUT HANDLER
 #
-# Чтобы бот понимал, является ли обычное сообщение
-# API key или названием модели, используем owner-only
-# простую проверку.
+# КЛЮЧЕВОЙ FIX
 # ============================================================
 
 @dp.message(
@@ -2974,746 +3173,212 @@ async def settings_input_handler(
     message: Message
 ):
 
-    if message.from_user.id != OWNER_ID:
+    user_id = message.from_user.id
+
+    # --------------------------------------------------------
+    # Только OWNER
+    # --------------------------------------------------------
+
+    if not is_owner(
+        user_id
+    ):
+
         return
 
-    text = message.text.strip()
+    state = USER_STATES.get(
+        user_id
+    )
 
-    if text.startswith("/"):
+    # --------------------------------------------------------
+    # Ничего не ждём
+    # --------------------------------------------------------
+
+    if not state:
+
         return
 
-    if text.startswith("."):
+    text = (
+        message.text
+        or
+        ""
+    ).strip()
+
+    # --------------------------------------------------------
+    # CANCEL
+    # --------------------------------------------------------
+
+    if text.lower() in (
+        "отмена",
+        "cancel",
+        "/cancel"
+    ):
+
+        USER_STATES.pop(
+            user_id,
+            None
+        )
+
+        await message.answer(
+            "❌ Действие отменено.\n\n"
+            +
+            settings_text(),
+            reply_markup=settings_keyboard()
+        )
+
         return
 
-    # Gemini API keys usually start with AIza.
-    if text.startswith("AIza") and len(text) >= 20:
+    # ========================================================
+    # WAITING API KEY
+    # ========================================================
 
-        config = load_config()
+    if state == "waiting_api_key":
 
-        keys = config.setdefault(
+        # Telegram API key обычно начинается с AIza,
+        # но не будем жёстко требовать конкретный формат,
+        # чтобы не ломать новые форматы ключей.
+
+        if (
+            len(text) < 20
+            or
+            len(text) > 500
+            or
+            any(
+                char.isspace()
+                for char in text
+            )
+        ):
+
+            await message.answer(
+                "❌ Похоже, это не API key.\n\n"
+                "Отправь ключ одним сообщением "
+                "без пробелов.\n\n"
+                "Для отмены: <code>отмена</code>"
+            )
+
+            return
+
+        settings = load_settings()
+
+        keys = settings.get(
             "api_keys",
             []
         )
 
         if text in keys:
 
-            await message.answer(
-                "⚠️ Этот API key уже добавлен."
-            )
-
-            return
-
-        keys.append(text)
-
-        save_config(config)
-
-        await message.answer(
-            "✅ <b>API key добавлен.</b>\n\n"
-            f"Всего ключей: <b>{len(keys)}</b>",
-            reply_markup=settings_keyboard()
-        )
-
-        return
-
-    # Model
-    if (
-        text.startswith("gemini-")
-        and
-        len(text) < 100
-        and
-        " " not in text
-    ):
-
-        config = load_config()
-
-        config["model"] = text
-
-        save_config(config)
-
-        await message.answer(
-            "✅ Модель изменена:\n"
-            f"<code>{html.escape(text)}</code>",
-            reply_markup=settings_keyboard()
-        )
-
-        return
-
-    # Remove key by number
-    if text.isdigit():
-
-        number = int(text)
-
-        config = load_config()
-
-        keys = config.get(
-            "api_keys",
-            []
-        )
-
-        if 1 <= number <= len(keys):
-
-            removed = keys.pop(
-                number - 1
-            )
-
-            save_config(config)
-
-            masked = (
-                removed[:6]
-                + "..."
-                + removed[-4:]
+            USER_STATES.pop(
+                user_id,
+                None
             )
 
             await message.answer(
-                "🗑 API key удалён:\n"
-                f"<code>{html.escape(masked)}</code>",
+                "⚠️ Этот API key уже есть в списке.\n\n"
+                +
+                settings_text(),
                 reply_markup=settings_keyboard()
             )
 
             return
 
+        keys.append(
+            text
+        )
 
-# ============================================================
-# AVAILABLE MODELS
-# ============================================================
+        settings["api_keys"] = keys
 
-async def send_available_models(
-    message: Message
-):
+        save_settings(
+            settings
+        )
 
-    keys = get_api_keys()
-
-    if not keys:
+        USER_STATES.pop(
+            user_id,
+            None
+        )
 
         await message.answer(
-            "❌ Нет API ключей."
+            "✅ <b>API key добавлен!</b>\n\n"
+
+            f"🔑 Key: "
+            f"<code>{html.escape(mask_api_key(text))}</code>\n"
+
+            f"📊 Всего ключей: "
+            f"<b>{len(keys)}</b>\n\n"
+
+            "Если этот ключ перестанет работать, "
+            "бот автоматически перейдёт к следующему.\n\n"
+
+            +
+            settings_text(),
+            reply_markup=settings_keyboard()
         )
 
         return
 
-    async with httpx.AsyncClient(
-        timeout=30
-    ) as client:
+    # ========================================================
+    # WAITING MODEL
+    # ========================================================
 
-        all_models = {}
+    if state == "waiting_model":
 
-        for index, api_key in enumerate(keys):
+        model = text
 
-            try:
+        model = model.replace(
+            "models/",
+            ""
+        ).strip()
 
-                response = await client.get(
-                    "https://generativelanguage.googleapis.com/"
-                    "v1beta/models",
-                    headers={
-                        "x-goog-api-key": api_key
-                    }
-                )
+        if (
+            len(model) < 3
+            or
+            len(model) > 150
+            or
+            " " in model
+        ):
 
-                if response.status_code != 200:
-                    continue
+            await message.answer(
+                "❌ Некорректное название модели.\n\n"
+                "Например:\n"
+                "<code>gemini-2.5-flash</code>"
+            )
 
-                data = response.json()
+            return
 
-                for model in data.get(
-                    "models",
-                    []
-                ):
+        settings = load_settings()
 
-                    name = model.get(
-                        "name",
-                        ""
-                    )
+        settings["model"] = model
 
-                    if name.startswith(
-                        "models/"
-                    ):
+        save_settings(
+            settings
+        )
 
-                        name = name[7:]
-
-                    if name:
-
-                        all_models[name] = True
-
-            except Exception:
-
-                logger.exception(
-                    "Models list failed for key %s",
-                    index + 1
-                )
-
-    if not all_models:
+        USER_STATES.pop(
+            user_id,
+            None
+        )
 
         await message.answer(
-            "❌ Не удалось получить список моделей."
+            "✅ <b>Модель изменена!</b>\n\n"
+
+            f"🤖 Теперь используется:\n"
+            f"<code>{html.escape(model)}</code>\n\n"
+
+            "Глобально для всего бота.",
+            reply_markup=settings_keyboard()
         )
 
         return
 
-    names = sorted(
-        all_models.keys()
-    )
-
-    # Prefer useful generative models
-    names = [
-        name
-        for name in names
-        if "generateContent" not in name
-        or True
-    ]
-
-    text = (
-        "<b>🔎 ДОСТУПНЫЕ GEMINI МОДЕЛИ</b>\n\n"
-    )
-
-    for name in names[:80]:
-
-        text += (
-            f"<code>{html.escape(name)}</code>\n"
-        )
-
-    await message.answer(
-        text
-    )
-
 
 # ============================================================
-# TEST ALL KEYS
+# RESOLVE TARGET
 # ============================================================
 
-async def test_all_keys(
-    message: Message
-):
-
-    keys = get_api_keys()
-    model = get_model()
-
-    if not keys:
-
-        await message.answer(
-            "❌ Нет API ключей."
-        )
-
-        return
-
-    text = (
-        "<b>🧪 ПРОВЕРКА GEMINI КЛЮЧЕЙ</b>\n\n"
-    )
-
-    async with httpx.AsyncClient(
-        timeout=30
-    ) as client:
-
-        for index, api_key in enumerate(keys):
-
-            try:
-
-                response = await client.post(
-                    (
-                        "https://generativelanguage.googleapis.com/"
-                        f"v1beta/models/{model}:generateContent"
-                    ),
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": api_key
-                    },
-                    json={
-                        "contents": [
-                            {
-                                "parts": [
-                                    {
-                                        "text": "Reply with OK."
-                                    }
-                                ]
-                            }
-                        ],
-                        "generationConfig": {
-                            "maxOutputTokens": 10
-                        }
-                    }
-                )
-
-                if response.status_code == 200:
-
-                    text += (
-                        f"✅ Key {index + 1}: "
-                        f"<b>OK</b>\n"
-                    )
-
-                else:
-
-                    body = response.text[:300]
-
-                    text += (
-                        f"❌ Key {index + 1}: "
-                        f"<code>"
-                        f"{response.status_code}"
-                        f"</code>\n"
-                        f"<code>"
-                        f"{html.escape(body)}"
-                        f"</code>\n"
-                    )
-
-            except Exception as error:
-
-                text += (
-                    f"❌ Key {index + 1}: "
-                    f"<code>"
-                    f"{html.escape(str(error)[:300])}"
-                    f"</code>\n"
-                )
-
-    await message.answer(
-        text
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
-@dp.message(
-    Command("start")
-)
-async def start_command(
-    message: Message
-):
-
-    await message.answer(
-        "<b>⚔️ MOG AI</b>\n\n"
-        "AI-баттлы Telegram-профилей.\n\n"
-        "🥊 Ответь на сообщение:\n"
-        "<code>.мог</code>\n\n"
-        "Или:\n"
-        "<code>.мог @username</code>\n\n"
-        "Gemini оценивает:\n"
-        "👤 NAME\n"
-        "🔤 USERNAME\n"
-        "📝 BIO\n"
-        "🔗 COHERENCE\n"
-        "✨ VIBE\n\n"
-        "🏆 Побеждает тот, у кого выше Overall."
-    )
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-@dp.message(
-    Command("help")
-)
-async def help_command(
-    message: Message
-):
-
-    await message.answer(
-        "<b>⚔️ MOG AI — COMMANDS</b>\n\n"
-        "<code>.мог</code>\n"
-        "Ответь на сообщение пользователя.\n\n"
-        "<code>.мог @username</code>\n"
-        "Сравнить себя с username.\n\n"
-        "<code>/mog</code>\n"
-        "То же самое.\n\n"
-        "<code>/stats</code>\n"
-        "Твоя статистика.\n\n"
-        "<code>/top</code>\n"
-        "Топ игроков.\n\n"
-        "<code>/history</code>\n"
-        "Последние баттлы.\n\n"
-        "<code>/настройки</code>\n"
-        "Настройки владельца.\n\n"
-        "<code>/help</code>\n"
-        "Список команд."
-    )
-
-
-# ============================================================
-# STATS
-# ============================================================
-
-@dp.message(
-    Command("stats")
-)
-async def stats_command(
-    message: Message
-):
-
-    data = load_data()
-
-    user_id = str(
-        message.from_user.id
-    )
-
-    user = data["users"].get(
-        user_id
-    )
-
-    if not user:
-
-        await message.answer(
-            "📊 У тебя пока нет MOG-баттлов."
-        )
-
-        return
-
-    battles = user["battles"]
-    wins = user["wins"]
-    losses = user["losses"]
-    draws = user["draws"]
-
-    if battles:
-
-        winrate = (
-            wins
-            /
-            battles
-            *
-            100
-        )
-
-        average = (
-            user["score_sum"]
-            /
-            battles
-        )
-
-    else:
-
-        winrate = 0
-        average = 0
-
-    await message.answer(
-        "<b>📊 YOUR MOG STATS</b>\n\n"
-        f"⚔️ Battles: <b>{battles}</b>\n"
-        f"🏆 Wins: <b>{wins}</b>\n"
-        f"💀 Losses: <b>{losses}</b>\n"
-        f"🤝 Draws: <b>{draws}</b>\n\n"
-        f"📈 Winrate: <b>{winrate:.1f}%</b>\n"
-        f"⭐ Average score: <b>{average:.2f}/10</b>"
-    )
-
-
-# ============================================================
-# TOP
-# ============================================================
-
-@dp.message(
-    Command("top")
-)
-async def top_command(
-    message: Message
-):
-
-    data = load_data()
-
-    users = []
-
-    for user_id, user in data["users"].items():
-
-        if user["battles"] <= 0:
-            continue
-
-        average = (
-            user["score_sum"]
-            /
-            user["battles"]
-        )
-
-        users.append(
-            {
-                "username": user["username"],
-                "wins": user["wins"],
-                "battles": user["battles"],
-                "average": average
-            }
-        )
-
-    users.sort(
-        key=lambda x: (
-            x["wins"],
-            x["average"]
-        ),
-        reverse=True
-    )
-
-    users = users[:10]
-
-    if not users:
-
-        await message.answer(
-            "🏆 Пока нет статистики."
-        )
-
-        return
-
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
-    ]
-
-    text = "<b>🏆 MOG TOP 10</b>\n\n"
-
-    for index, user in enumerate(users):
-
-        if index < 3:
-            position = medals[index]
-        else:
-            position = f"<b>{index + 1}.</b>"
-
-        username = html.escape(
-            str(user["username"])
-        )
-
-        text += (
-            f"{position} "
-            f"{username} — "
-            f"<b>{user['wins']}</b> wins "
-            f"• {user['average']:.2f}/10\n"
-        )
-
-    await message.answer(
-        text
-    )
-
-
-# ============================================================
-# HISTORY
-# ============================================================
-
-@dp.message(
-    Command("history")
-)
-async def history_command(
-    message: Message
-):
-
-    data = load_data()
-
-    battles = data["battles"][-10:]
-
-    if not battles:
-
-        await message.answer(
-            "📜 История пока пустая."
-        )
-
-        return
-
-    battles.reverse()
-
-    text = (
-        "<b>📜 LAST MOG BATTLES</b>\n\n"
-    )
-
-    for battle in battles:
-
-        if battle["winner"] == 0:
-
-            winner = battle["player1"]
-
-        elif battle["winner"] == 1:
-
-            winner = battle["player2"]
-
-        else:
-
-            winner = "DRAW"
-
-        p1 = html.escape(
-            str(battle["player1"])
-        )
-
-        p2 = html.escape(
-            str(battle["player2"])
-        )
-
-        winner = html.escape(
-            str(winner)
-        )
-
-        text += (
-            f"⚔️ {p1} "
-            f"<b>{battle['score1']:.2f}</b>"
-            f" × "
-            f"<b>{battle['score2']:.2f}</b> "
-            f"{p2}\n"
-            f"🏆 {winner}\n\n"
-        )
-
-    await message.answer(
-        text
-    )
-
-
-# ============================================================
-# REMATCH
-# ============================================================
-
-@dp.callback_query(
-    F.data.startswith("rematch:")
-)
-async def rematch_callback(
-    callback: CallbackQuery,
+async def resolve_target(
+    message: Message,
     bot: Bot
 ):
 
-    try:
-
-        parts = callback.data.split(":")
-
-        if len(parts) != 3:
-            raise ValueError(
-                "Invalid callback data"
-            )
-
-        player1_id = int(
-            parts[1]
-        )
-
-        player2_id = int(
-            parts[2]
-        )
-
-        await callback.answer(
-            "🔄 Новый MOG!"
-        )
-
-        await run_mog(
-            callback.message,
-            bot,
-            player1_id,
-            player2_id
-        )
-
-    except Exception as error:
-
-        logger.exception(
-            "Rematch failed"
-        )
-
-        await callback.answer(
-            "❌ Ошибка",
-            show_alert=True
-        )
-
-
-# ============================================================
-# DETAILS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "details"
-)
-async def details_callback(
-    callback: CallbackQuery
-):
-
-    await callback.answer(
-        "Карточка содержит все пять оценок.",
-        show_alert=True
-    )
-
-
-# ============================================================
-# UNKNOWN COMMAND DEBUG
-# ============================================================
-
-@dp.message(
-    F.text.startswith("/")
-)
-async def unknown_command_handler(
-    message: Message
-):
-
-    await message.answer(
-        "❓ Неизвестная команда.\n\n"
-        "Напиши <code>/help</code>."
-    )
-
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-@dp.errors()
-async def global_error_handler(
-    event
-):
-
-    logger.exception(
-        "Unhandled dispatcher error: %s",
-        event.exception
-    )
-
-    return True
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-async def main():
-
-    logger.info(
-        "========================================"
-    )
-
-    logger.info(
-        "Starting MOG AI bot..."
-    )
-
-    logger.info(
-        "Owner ID: %s",
-        OWNER_ID
-    )
-
-    logger.info(
-        "Gemini model: %s",
-        get_model()
-    )
-
-    logger.info(
-        "Gemini API keys: %s",
-        len(get_api_keys())
-    )
-
-    logger.info(
-        "========================================"
-    )
-
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML
-        )
-    )
-
-    try:
-
-        me = await bot.get_me()
-
-        logger.info(
-            "Logged in as @%s",
-            me.username
-        )
-
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types()
-        )
-
-    finally:
-
-        await bot.session.close()
-
-
-# ============================================================
-# RUN
-# ============================================================
-
-if __name__ == "__main__":
-
-    asyncio.run(
-        main()
-        )
+    if (
+        message.reply_to_message
+        and
+        message.reply_to
