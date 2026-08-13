@@ -1,11 +1,13 @@
 import asyncio
 import base64
+import html
 import io
 import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
@@ -29,6 +31,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# Current model requested for this bot.
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.5-flash"
@@ -36,29 +39,20 @@ GEMINI_MODEL = os.getenv(
 
 DATA_FILE = "mog_data.json"
 
-# ============================================================
-# FONT SCALE
-# ============================================================
-# Меняй ТОЛЬКО ЭТО ЧИСЛО.
-#
-# 1.0  = обычный размер
-# 1.25 = +25%
-# 1.5  = +50%
-# 2.0  = в 2 раза больше
-#
-FONT_SCALE = 2.5
-
+# Gemini retry settings
+GEMINI_MAX_RETRIES = 4
+GEMINI_TIMEOUT = 120
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN is not set"
-    )
+    raise RuntimeError("BOT_TOKEN is not set")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is not set"
-    )
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,27 +61,68 @@ logging.basicConfig(
 
 logger = logging.getLogger("mog_ai")
 
+
 dp = Dispatcher()
+
+
+# ============================================================
+# FONT SETTINGS
+#
+# ВСЕ размеры шрифтов меняются ТОЛЬКО ЗДЕСЬ.
+# ============================================================
+
+FONT_SIZES = {
+    "title": 64,
+    "subtitle": 25,
+
+    "profile_label": 22,
+
+    "name": 42,
+    "username": 27,
+
+    "category": 27,
+    "score": 27,
+
+    "overall_label": 24,
+    "overall_score": 39,
+
+    "status": 34,
+    "winner": 42,
+
+    "difference_label": 23,
+    "difference_score": 29,
+
+    "verdict": 25,
+    "footer": 17,
+
+    "vs": 62,
+    "mogged": 52,
+
+    "crown": 40,
+}
 
 
 # ============================================================
 # SCORING
 # ============================================================
 
+# Только 5 категорий.
+#
+# Avatar не является отдельной категорией.
+# Он используется Gemini при оценке coherence/vibe.
+
 WEIGHTS = {
-    "avatar": 0.25,
-    "username": 0.17,
-    "name": 0.13,
-    "bio": 0.17,
-    "coherence": 0.14,
-    "vibe": 0.14,
+    "name": 0.20,
+    "username": 0.20,
+    "bio": 0.20,
+    "coherence": 0.20,
+    "vibe": 0.20,
 }
 
 
 CATEGORIES = [
-    ("AVATAR", "avatar"),
-    ("USERNAME", "username"),
     ("NAME", "name"),
+    ("USERNAME", "username"),
     ("BIO", "bio"),
     ("COHERENCE", "coherence"),
     ("VIBE", "vibe"),
@@ -95,7 +130,7 @@ CATEGORIES = [
 
 
 # ============================================================
-# PROFILE OBJECT
+# PROFILE
 # ============================================================
 
 class Profile:
@@ -171,10 +206,7 @@ def load_data():
 
 def save_data(data):
 
-    temporary_file = (
-        DATA_FILE
-        + ".tmp"
-    )
+    temporary_file = DATA_FILE + ".tmp"
 
     try:
 
@@ -209,9 +241,7 @@ def ensure_user(
     username
 ):
 
-    user_id = str(
-        user_id
-    )
+    user_id = str(user_id)
 
     if user_id not in data["users"]:
 
@@ -289,7 +319,9 @@ def register_battle(
         p2["draws"] += 1
 
     battle = {
-        "time": datetime.utcnow().isoformat(),
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat(),
 
         "player1":
             player1.username,
@@ -314,13 +346,12 @@ def register_battle(
         battle
     )
 
+    # Keep latest 500.
     data["battles"] = (
         data["battles"][-500:]
     )
 
-    save_data(
-        data
-    )
+    save_data(data)
 
 
 # ============================================================
@@ -420,64 +451,125 @@ async def analyze_with_gemini(
 You are the AI judge of a humorous Telegram profile
 comparison game called MOG.
 
-Compare TWO Telegram profiles.
+You are comparing TWO Telegram profiles.
 
-The goal is to judge profile presentation, not the person.
+The goal is to judge profile presentation and style,
+NOT the person behind the profile.
 
-Score these categories from 0.0 to 10.0:
+There are EXACTLY FIVE scoring categories.
 
-1. avatar
-2. username
-3. name
-4. bio
-5. coherence
-6. vibe
+Score every category from 0.0 to 10.0.
 
-AVATAR:
-Judge visual quality, composition, recognizability,
-originality and suitability as a profile avatar.
+1. NAME
+2. USERNAME
+3. BIO
+4. COHERENCE
+5. VIBE
 
-USERNAME:
-Judge readability, memorability, uniqueness and style.
 
 NAME:
-Judge the displayed Telegram profile name itself.
-Judge readability, memorability, typography/style,
-originality and how well it works as a displayed profile name.
+Judge the displayed Telegram name itself.
+
+Consider:
+- readability
+- memorability
+- style
+- originality
+- presentation
+- how well the name works as a profile name
+
+Do NOT infer age, ethnicity, religion, politics,
+sexual orientation, health, disability or other
+sensitive characteristics from the name.
+
+
+USERNAME:
+Judge the username itself.
+
+Consider:
+- readability
+- memorability
+- originality
+- simplicity
+- visual style
+- how strong it looks as a Telegram username
+
 
 BIO:
-Judge writing quality, originality, personality and presentation.
+Judge the bio text.
+
+Consider:
+- writing quality
+- originality
+- personality expressed through the text
+- clarity
+- style
+- presentation
+
+If there is no bio, score based on the absence.
+Do NOT invent a bio.
+
 
 COHERENCE:
-Judge how well avatar, username, name and bio fit together.
+Judge how well the whole profile works together.
+
+Consider:
+- name
+- username
+- bio
+- avatar
+- visual and textual consistency
+- whether the elements feel like one coherent profile
+
+The avatar is used here as part of the overall profile,
+but DO NOT create a separate avatar score.
+
 
 VIBE:
-Judge the overall profile presentation and style.
+Judge the overall presentation and style of the profile.
 
-IMPORTANT:
+The avatar may be considered here.
 
-Do not judge or infer:
+Consider:
+- overall visual impression
+- style
+- consistency
+- memorability
+- profile energy
+- presentation quality
+
+Do NOT judge physical attractiveness.
+
+
+IMPORTANT SAFETY RULES:
+
+Do NOT judge or infer:
 
 - race
 - ethnicity
+- nationality
 - religion
 - political affiliation
 - sexual orientation
+- gender identity
 - health
 - disability
 - body
 - physical attractiveness
-- sensitive personal characteristics
 - exact age
+- socioeconomic status
+- other sensitive personal characteristics
 
 Do not invent information.
 
-If a bio is missing, score the bio based on the absence
-and do not invent content.
+Do not treat absence of information as negative
+unless that category specifically requires information.
 
-Use the complete 0-10 scale.
+Use the full 0-10 scale.
 
 Do not give everyone similar scores.
+
+Be critical but humorous.
 
 Return ONLY valid JSON.
 
@@ -486,32 +578,28 @@ Required format:
 {
   "players": [
     {
-      "avatar": 0.0,
-      "username": 0.0,
       "name": 0.0,
+      "username": 0.0,
       "bio": 0.0,
       "coherence": 0.0,
       "vibe": 0.0,
       "reasons": {
-        "avatar": "short reason",
-        "username": "short reason",
         "name": "short reason",
+        "username": "short reason",
         "bio": "short reason",
         "coherence": "short reason",
         "vibe": "short reason"
       }
     },
     {
-      "avatar": 0.0,
-      "username": 0.0,
       "name": 0.0,
+      "username": 0.0,
       "bio": 0.0,
       "coherence": 0.0,
       "vibe": 0.0,
       "reasons": {
-        "avatar": "short reason",
-        "username": "short reason",
         "name": "short reason",
+        "username": "short reason",
         "bio": "short reason",
         "coherence": "short reason",
         "vibe": "short reason"
@@ -522,9 +610,7 @@ Required format:
 }
 """
 
-    def profile_text(
-        profile
-    ):
+    def profile_text(profile):
 
         return (
             f"USERNAME: {profile.username}\n"
@@ -558,6 +644,10 @@ Required format:
         }
     ]
 
+    # ========================================================
+    # PLAYER 1 AVATAR
+    # ========================================================
+
     if player1.avatar:
 
         parts.append(
@@ -582,6 +672,19 @@ Required format:
                     "The previous image is PLAYER 1 avatar."
             }
         )
+
+    else:
+
+        parts.append(
+            {
+                "text":
+                    "PLAYER 1 has no avatar."
+            }
+        )
+
+    # ========================================================
+    # PLAYER 2 AVATAR
+    # ========================================================
 
     if player2.avatar:
 
@@ -608,6 +711,15 @@ Required format:
             }
         )
 
+    else:
+
+        parts.append(
+            {
+                "text":
+                    "PLAYER 2 has no avatar."
+            }
+        )
+
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
@@ -622,25 +734,154 @@ Required format:
 
         "generationConfig": {
             "temperature": 0.25,
+
             "responseMimeType":
                 "application/json"
         }
     }
 
+    # ========================================================
+    # REQUEST WITH RETRIES
+    # ========================================================
+
     async with httpx.AsyncClient(
-        timeout=120
+        timeout=GEMINI_TIMEOUT
     ) as client:
 
-        response = await client.post(
-            url,
-            params={
-                "key":
-                    GEMINI_API_KEY
-            },
-            json=payload
-        )
+        response = None
 
-        if response.status_code != 200:
+        for attempt in range(
+            GEMINI_MAX_RETRIES
+        ):
+
+            try:
+
+                response = await client.post(
+                    url,
+                    params={
+                        "key":
+                            GEMINI_API_KEY
+                    },
+                    json=payload
+                )
+
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError
+            ) as error:
+
+                if (
+                    attempt
+                    >=
+                    GEMINI_MAX_RETRIES - 1
+                ):
+
+                    raise RuntimeError(
+                        "Gemini network/timeout error."
+                    ) from error
+
+                wait_time = (
+                    3
+                    *
+                    (
+                        2 ** attempt
+                    )
+                )
+
+                logger.warning(
+                    "Gemini network error. "
+                    "Retry %s/%s in %s sec: %s",
+                    attempt + 1,
+                    GEMINI_MAX_RETRIES,
+                    wait_time,
+                    error
+                )
+
+                await asyncio.sleep(
+                    wait_time
+                )
+
+                continue
+
+            # =================================================
+            # SUCCESS
+            # =================================================
+
+            if response.status_code == 200:
+
+                break
+
+            # =================================================
+            # RATE LIMIT
+            # =================================================
+
+            if response.status_code == 429:
+
+                if attempt >= (
+                    GEMINI_MAX_RETRIES - 1
+                ):
+
+                    logger.error(
+                        "Gemini 429 after all retries: %s",
+                        response.text[:1000]
+                    )
+
+                    raise RuntimeError(
+                        "Gemini API rate limit exceeded. "
+                        "Попробуй ещё раз немного позже."
+                    )
+
+                retry_after = (
+                    response.headers.get(
+                        "Retry-After"
+                    )
+                )
+
+                if retry_after:
+
+                    try:
+
+                        wait_time = float(
+                            retry_after
+                        )
+
+                    except ValueError:
+
+                        wait_time = (
+                            4
+                            *
+                            (
+                                2 ** attempt
+                            )
+                        )
+
+                else:
+
+                    wait_time = (
+                        4
+                        *
+                        (
+                            2 ** attempt
+                        )
+                    )
+
+                logger.warning(
+                    "Gemini HTTP 429. "
+                    "Retry %s/%s in %.1f sec",
+                    attempt + 1,
+                    GEMINI_MAX_RETRIES,
+                    wait_time
+                )
+
+                await asyncio.sleep(
+                    wait_time
+                )
+
+                continue
+
+            # =================================================
+            # OTHER HTTP ERROR
+            # =================================================
 
             logger.error(
                 "Gemini HTTP %s: %s",
@@ -648,20 +889,32 @@ Required format:
                 response.text[:1000]
             )
 
-        response.raise_for_status()
+            response.raise_for_status()
 
-        data = response.json()
+        else:
+
+            raise RuntimeError(
+                "Gemini request failed."
+            )
+
+    # ========================================================
+    # EXTRACT RESPONSE
+    # ========================================================
 
     try:
 
         text = (
-            data[
+            response.json()
+            [
                 "candidates"
-            ][0][
+            ][0]
+            [
                 "content"
-            ][
+            ]
+            [
                 "parts"
-            ][0][
+            ][0]
+            [
                 "text"
             ]
         )
@@ -670,12 +923,16 @@ Required format:
 
         logger.error(
             "Invalid Gemini response: %s",
-            data
+            response.text[:3000]
         )
 
         raise RuntimeError(
             "Gemini returned an invalid response."
         )
+
+    # ========================================================
+    # CLEAN JSON
+    # ========================================================
 
     text = re.sub(
         r"```json\s*",
@@ -699,6 +956,11 @@ Required format:
     )
 
     if not match:
+
+        logger.error(
+            "Gemini did not return JSON: %s",
+            text
+        )
 
         raise RuntimeError(
             "Gemini did not return JSON."
@@ -726,9 +988,7 @@ Required format:
 # SCORE CALCULATION
 # ============================================================
 
-def clamp(
-    value
-):
+def clamp(value):
 
     try:
 
@@ -793,6 +1053,30 @@ def calculate_scores(
             2
         )
 
+        # Keep AI reasons for Details.
+        reasons = raw.get(
+            "reasons",
+            {}
+        )
+
+        if not isinstance(
+            reasons,
+            dict
+        ):
+
+            reasons = {}
+
+        scores["reasons"] = {
+            key: str(
+                reasons.get(
+                    key,
+                    ""
+                )
+            )[:300]
+
+            for key in WEIGHTS
+        }
+
         players.append(
             scores
         )
@@ -807,6 +1091,7 @@ def calculate_scores(
         2
     )
 
+    # Close result = draw.
     if difference < 0.10:
 
         winner = None
@@ -890,10 +1175,28 @@ def calculate_scores(
 # FONTS
 # ============================================================
 
+_FONT_CACHE = {}
+
+
 def get_font(
-    size,
+    key,
     bold=False
 ):
+
+    cache_key = (
+        key,
+        bold
+    )
+
+    if cache_key in _FONT_CACHE:
+
+        return _FONT_CACHE[
+            cache_key
+        ]
+
+    size = FONT_SIZES[
+        key
+    ]
 
     if bold:
 
@@ -915,47 +1218,33 @@ def get_font(
 
         if os.path.exists(path):
 
-            return ImageFont.truetype(
+            font = ImageFont.truetype(
                 path,
                 size
             )
 
-    return ImageFont.load_default()
+            _FONT_CACHE[
+                cache_key
+            ] = font
+
+            return font
+
+    font = ImageFont.load_default()
+
+    _FONT_CACHE[
+        cache_key
+    ] = font
+
+    return font
 
 
 # ============================================================
-# CARD FONT
-# ============================================================
-# НИЖЕ БОЛЬШЕ НИЧЕГО В create_card() МЕНЯТЬ НЕ НУЖНО.
-#
-# Все размеры автоматически умножаются на FONT_SCALE.
-# ============================================================
-
-def card_font(
-    size,
-    bold=False
-):
-
-    scaled_size = max(
-        1,
-        int(
-            size * FONT_SCALE
-        )
-    )
-
-    return get_font(
-        scaled_size,
-        bold
-    )
-
-
-# ============================================================
-# AVATAR
+# IMAGE HELPERS
 # ============================================================
 
 def make_avatar(
     data,
-    size=250
+    size=260
 ):
 
     result = Image.new(
@@ -1074,6 +1363,7 @@ def make_avatar(
         result
     )
 
+    # Outer border
     draw.ellipse(
         (
             2,
@@ -1081,15 +1371,645 @@ def make_avatar(
             size - 3,
             size - 3
         ),
-        outline="#44444f",
-        width=4
+        outline="#f4c542",
+        width=5
     )
 
     return result
 
 
+def rounded_panel(
+    draw,
+    box,
+    radius=28,
+    fill="#111117",
+    outline="#1f1f28",
+    width=2
+):
+
+    draw.rounded_rectangle(
+        box,
+        radius=radius,
+        fill=fill,
+        outline=outline,
+        width=width
+    )
+
+
+def text_width(
+    draw,
+    text,
+    font
+):
+
+    bbox = draw.textbbox(
+        (
+            0,
+            0
+        ),
+        text,
+        font=font
+    )
+
+    return (
+        bbox[2]
+        -
+        bbox[0]
+    )
+
+
+def text_center(
+    draw,
+    text,
+    center_x,
+    y,
+    font,
+    fill
+):
+
+    width = text_width(
+        draw,
+        text,
+        font
+    )
+
+    draw.text(
+        (
+            center_x - width / 2,
+            y
+        ),
+        text,
+        font=font,
+        fill=fill
+    )
+
+
+def truncate_text(
+    text,
+    max_chars
+):
+
+    text = str(
+        text or ""
+    )
+
+    if len(text) <= max_chars:
+
+        return text
+
+    return (
+        text[
+            :max_chars - 1
+        ]
+        + "…"
+    )
+
+
+def wrap_text(
+    draw,
+    text,
+    font,
+    max_width
+):
+
+    text = str(
+        text or ""
+    ).strip()
+
+    if not text:
+
+        return [""]
+
+    words = text.split()
+
+    lines = []
+    current = ""
+
+    for word in words:
+
+        test = (
+            word
+            if not current
+            else current + " " + word
+        )
+
+        if (
+            text_width(
+                draw,
+                test,
+                font
+            )
+            <= max_width
+        ):
+
+            current = test
+
+        else:
+
+            if current:
+
+                lines.append(
+                    current
+                )
+
+            current = word
+
+    if current:
+
+        lines.append(
+            current
+        )
+
+    return lines
+
+
 # ============================================================
-# CARD
+# DRAW CROWN
+# ============================================================
+
+def draw_crown(
+    draw,
+    center_x,
+    y
+):
+
+    yellow = "#f4c542"
+
+    points = [
+        (
+            center_x - 75,
+            y + 45
+        ),
+        (
+            center_x - 58,
+            y - 8
+        ),
+        (
+            center_x - 18,
+            y + 28
+        ),
+        (
+            center_x,
+            y - 20
+        ),
+        (
+            center_x + 18,
+            y + 28
+        ),
+        (
+            center_x + 58,
+            y - 8
+        ),
+        (
+            center_x + 75,
+            y + 45
+        )
+    ]
+
+    draw.polygon(
+        points,
+        fill=yellow
+    )
+
+    draw.rounded_rectangle(
+        (
+            center_x - 75,
+            y + 35,
+            center_x + 75,
+            y + 62
+        ),
+        radius=7,
+        fill=yellow
+    )
+
+
+# ============================================================
+# DRAW PROFILE HEADER
+# ============================================================
+
+def draw_profile_header(
+    image,
+    draw,
+    player,
+    center_x,
+    top_y,
+    role,
+    is_winner
+):
+
+    WHITE = "#f4f4f7"
+    MUTED = "#858591"
+    YELLOW = "#f4c542"
+    PANEL = "#101017"
+    BORDER = "#1d1d25"
+
+    panel_w = 620
+
+    rounded_panel(
+        draw,
+        (
+            center_x - panel_w // 2,
+            top_y,
+            center_x + panel_w // 2,
+            top_y + 450
+        ),
+        radius=30,
+        fill=PANEL,
+        outline=BORDER,
+        width=2
+    )
+
+    # ========================================================
+    # CROWN
+    # ========================================================
+
+    if is_winner:
+
+        draw_crown(
+            draw,
+            center_x,
+            top_y + 15
+        )
+
+    # ========================================================
+    # AVATAR
+    # ========================================================
+
+    avatar_size = 250
+
+    avatar = make_avatar(
+        player.avatar,
+        avatar_size
+    )
+
+    avatar_x = (
+        center_x
+        -
+        avatar_size // 2
+    )
+
+    avatar_y = (
+        top_y
+        + 55
+    )
+
+    image.paste(
+        avatar,
+        (
+            avatar_x,
+            avatar_y
+        ),
+        avatar
+    )
+
+    # ========================================================
+    # ROLE
+    # ========================================================
+
+    role_font = get_font(
+        "profile_label",
+        True
+    )
+
+    role_width = text_width(
+        draw,
+        role,
+        role_font
+    ) + 60
+
+    role_y = (
+        top_y
+        + 315
+    )
+
+    draw.rounded_rectangle(
+        (
+            center_x - role_width / 2,
+            role_y,
+            center_x + role_width / 2,
+            role_y + 42
+        ),
+        radius=21,
+        fill="#25252d"
+    )
+
+    text_center(
+        draw,
+        role,
+        center_x,
+        role_y + 7,
+        role_font,
+        YELLOW if is_winner else MUTED
+    )
+
+    # ========================================================
+    # NAME
+    # ========================================================
+
+    name = truncate_text(
+        player.name,
+        24
+    )
+
+    text_center(
+        draw,
+        name,
+        center_x,
+        top_y + 365,
+        get_font(
+            "name",
+            True
+        ),
+        WHITE
+    )
+
+    # ========================================================
+    # USERNAME
+    # ========================================================
+
+    username = truncate_text(
+        player.username,
+        28
+    )
+
+    text_center(
+        draw,
+        username,
+        center_x,
+        top_y + 410,
+        get_font(
+            "username",
+            True
+        ),
+        YELLOW if is_winner else MUTED
+    )
+
+
+# ============================================================
+# DRAW SCORE ROW
+# ============================================================
+
+def draw_score_row(
+    draw,
+    x,
+    y,
+    label,
+    score,
+    bar_width=500
+):
+
+    WHITE = "#f4f4f7"
+    MUTED = "#858591"
+    BAR_BG = "#292932"
+    YELLOW = "#f4c542"
+
+    # Label
+    draw.text(
+        (
+            x,
+            y
+        ),
+        label,
+        font=get_font(
+            "category",
+            True
+        ),
+        fill=MUTED
+    )
+
+    # Bar
+    bar_x = x + 235
+
+    bar_y = y + 5
+
+    bar_h = 24
+
+    draw.rounded_rectangle(
+        (
+            bar_x,
+            bar_y,
+            bar_x + bar_width,
+            bar_y + bar_h
+        ),
+        radius=12,
+        fill=BAR_BG
+    )
+
+    actual_width = (
+        bar_width
+        *
+        score
+        /
+        10
+    )
+
+    if actual_width > 0:
+
+        draw.rounded_rectangle(
+            (
+                bar_x,
+                bar_y,
+                bar_x + actual_width,
+                bar_y + bar_h
+            ),
+            radius=12,
+            fill=YELLOW
+        )
+
+    # Score
+    draw.text(
+        (
+            bar_x + bar_width + 20,
+            y - 3
+        ),
+        f"{score:.2f}",
+        font=get_font(
+            "score",
+            True
+        ),
+        fill=WHITE
+    )
+
+
+# ============================================================
+# DRAW SCORE SECTION
+# ============================================================
+
+def draw_score_section(
+    draw,
+    player,
+    result_player,
+    center_x,
+    top_y,
+    is_winner
+):
+
+    PANEL = "#101017"
+    BORDER = "#1d1d25"
+    WHITE = "#f4f4f7"
+    MUTED = "#858591"
+    PURPLE = "#8b5cf6"
+    PURPLE_DARK = "#251c3a"
+
+    panel_w = 1300
+
+    section_h = 470
+
+    rounded_panel(
+        draw,
+        (
+            center_x - panel_w // 2,
+            top_y,
+            center_x + panel_w // 2,
+            top_y + section_h
+        ),
+        radius=28,
+        fill=PANEL,
+        outline=BORDER,
+        width=2
+    )
+
+    # ========================================================
+    # OVERALL
+    # ========================================================
+
+    overall_y = top_y + 28
+
+    draw.text(
+        (
+            center_x - 600,
+            overall_y
+        ),
+        "OVERALL SCORE",
+        font=get_font(
+            "overall_label",
+            True
+        ),
+        fill=MUTED
+    )
+
+    overall = result_player[
+        "overall"
+    ]
+
+    draw.text(
+        (
+            center_x - 600,
+            overall_y + 31
+        ),
+        f"{overall:.2f}",
+        font=get_font(
+            "overall_score",
+            True
+        ),
+        fill=WHITE
+    )
+
+    # Small overall bar
+    bar_x = center_x - 350
+    bar_y = overall_y + 45
+    bar_w = 900
+    bar_h = 28
+
+    draw.rounded_rectangle(
+        (
+            bar_x,
+            bar_y,
+            bar_x + bar_w,
+            bar_y + bar_h
+        ),
+        radius=14,
+        fill=PURPLE_DARK
+    )
+
+    fill_w = (
+        bar_w
+        *
+        overall
+        /
+        10
+    )
+
+    if fill_w > 0:
+
+        draw.rounded_rectangle(
+            (
+                bar_x,
+                bar_y,
+                bar_x + fill_w,
+                bar_y + bar_h
+            ),
+            radius=14,
+            fill=PURPLE
+        )
+
+    # ========================================================
+    # CATEGORY ROWS
+    # ========================================================
+
+    rows_y = top_y + 105
+
+    for index, (
+        label,
+        key
+    ) in enumerate(
+        CATEGORIES
+    ):
+
+        draw_score_row(
+            draw,
+            center_x - 600,
+            rows_y + index * 66,
+            label,
+            result_player[key],
+            bar_width=700
+        )
+
+    # ========================================================
+    # WINNER INDICATOR
+    # ========================================================
+
+    if is_winner:
+
+        winner_text = "WINNER"
+
+        winner_font = get_font(
+            "profile_label",
+            True
+        )
+
+        winner_width = (
+            text_width(
+                draw,
+                winner_text,
+                winner_font
+            )
+            + 50
+        )
+
+        draw.rounded_rectangle(
+            (
+                center_x + 430,
+                top_y + 25,
+                center_x + 430 + winner_width,
+                top_y + 65
+            ),
+            radius=20,
+            fill="#3b2d08"
+        )
+
+        text_center(
+            draw,
+            winner_text,
+            center_x + 430 + winner_width / 2,
+            top_y + 31,
+            winner_font,
+            "#f4c542"
+        )
+
+
+# ============================================================
+# CREATE CARD
 # ============================================================
 
 def create_card(
@@ -1099,25 +2019,18 @@ def create_card(
 ):
 
     # ========================================================
-    # CARD SIZE
+    # CANVAS
     # ========================================================
 
     W = 1440
-    H = 1750
-
-    # ========================================================
-    # COLORS
-    # ========================================================
+    H = 2150
 
     BG = "#09090d"
-    PANEL = "#101017"
     WHITE = "#f4f4f7"
     MUTED = "#858591"
     YELLOW = "#f4c542"
     PURPLE = "#8b5cf6"
-    PURPLE_DARK = "#251c3a"
     RED = "#ff3030"
-    BAR_BG = "#292932"
     BORDER = "#1d1d25"
 
     image = Image.new(
@@ -1133,601 +2046,279 @@ def create_card(
         image
     )
 
-    # ========================================================
-    # HELPERS
-    # ========================================================
-
-    def text_center(
-        text,
-        center_x,
-        y,
-        font,
-        fill
-    ):
-
-        bbox = draw.textbbox(
-            (
-                0,
-                0
-            ),
-            text,
-            font=font
-        )
-
-        width = (
-            bbox[2]
-            -
-            bbox[0]
-        )
-
-        draw.text(
-            (
-                center_x
-                -
-                width / 2,
-                y
-            ),
-            text,
-            font=font,
-            fill=fill
-        )
-
-    def truncate(
-        text,
-        max_chars
-    ):
-
-        text = str(
-            text or ""
-        )
-
-        if len(text) <= max_chars:
-
-            return text
-
-        return (
-            text[
-                :max_chars - 1
-            ]
-            + "…"
-        )
+    center_x = W // 2
 
     # ========================================================
     # HEADER
     # ========================================================
 
     text_center(
+        draw,
         "MOG BATTLE",
-        W // 2,
+        center_x,
         35,
-        card_font(
-            64,
+        get_font(
+            "title",
             True
         ),
-        WHITE
+        YELLOW
     )
 
     text_center(
+        draw,
         "AI PROFILE COMPARISON",
-        W // 2,
-        120,
-        card_font(
-            25,
+        center_x,
+        105,
+        get_font(
+            "subtitle",
             True
         ),
         MUTED
     )
 
     # ========================================================
-    # PLAYERS
+    # WINNER
     # ========================================================
 
-    players = [
+    winner = result[
+        "winner"
+    ]
+
+    # ========================================================
+    # PLAYER 1 HEADER
+    # ========================================================
+
+    draw_profile_header(
+        image,
+        draw,
         player1,
-        player2
-    ]
-
-    centers = [
-        360,
-        1080
-    ]
-
-    avatar_size = 250
-    avatar_y = 220
-
-    for i, (
-        player,
-        center_x
-    ) in enumerate(
-        zip(
-            players,
-            centers
-        )
-    ):
-
-        # ====================================================
-        # PLAYER PANEL
-        # ====================================================
-
-        draw.rounded_rectangle(
-            (
-                center_x - 310,
-                195,
-                center_x + 310,
-                585
-            ),
-            radius=28,
-            fill=PANEL,
-            outline=BORDER,
-            width=2
-        )
-
-        # ====================================================
-        # CROWN
-        # ====================================================
-
-        if result["winner"] == i:
-
-            crown_y = 145
-
-            draw.rounded_rectangle(
-                (
-                    center_x - 82,
-                    crown_y + 45,
-                    center_x + 82,
-                    crown_y + 68
-                ),
-                radius=7,
-                fill=YELLOW
-            )
-
-            crown_points = [
-                (
-                    center_x - 80,
-                    crown_y + 48
-                ),
-                (
-                    center_x - 64,
-                    crown_y - 3
-                ),
-                (
-                    center_x - 20,
-                    crown_y + 29
-                ),
-                (
-                    center_x,
-                    crown_y - 18
-                ),
-                (
-                    center_x + 20,
-                    crown_y + 29
-                ),
-                (
-                    center_x + 64,
-                    crown_y - 3
-                ),
-                (
-                    center_x + 80,
-                    crown_y + 48
-                )
-            ]
-
-            draw.polygon(
-                crown_points,
-                fill=YELLOW
-            )
-
-            for jewel_x in [
-                center_x - 64,
-                center_x,
-                center_x + 64
-            ]:
-
-                draw.ellipse(
-                    (
-                        jewel_x - 6,
-                        crown_y + 28,
-                        jewel_x + 6,
-                        crown_y + 40
-                    ),
-                    fill=PURPLE
-                )
-
-        # ====================================================
-        # AVATAR
-        # ====================================================
-
-        avatar = make_avatar(
-            player.avatar,
-            avatar_size
-        )
-
-        avatar_x = (
-            center_x
-            -
-            avatar_size // 2
-        )
-
-        image.paste(
-            avatar,
-            (
-                avatar_x,
-                avatar_y
-            ),
-            avatar
-        )
-
-        # ====================================================
-        # MOGGED STAMP
-        # ====================================================
-
-        if result["loser"] == i:
-
-            stamp_w = 350
-            stamp_h = 90
-
-            stamp = Image.new(
-                "RGBA",
-                (
-                    stamp_w,
-                    stamp_h
-                ),
-                (
-                    0,
-                    0,
-                    0,
-                    0
-                )
-            )
-
-            stamp_draw = ImageDraw.Draw(
-                stamp
-            )
-
-            stamp_draw.rounded_rectangle(
-                (
-                    2,
-                    2,
-                    stamp_w - 3,
-                    stamp_h - 3
-                ),
-                radius=16,
-                fill=(
-                    255,
-                    48,
-                    48,
-                    225
-                ),
-                outline=(
-                    255,
-                    255,
-                    255,
-                    180
-                ),
-                width=3
-            )
-
-            stamp_draw.text(
-                (
-                    stamp_w // 2,
-                    10
-                ),
-                "MOGGED",
-                font=card_font(
-                    50,
-                    True
-                ),
-                fill="white",
-                anchor="ma"
-            )
-
-            stamp = stamp.rotate(
-                12,
-                expand=True,
-                resample=
-                    Image.Resampling.BICUBIC
-            )
-
-            stamp_x = (
-                center_x
-                -
-                stamp.width // 2
-            )
-
-            stamp_y = 375
-
-            image.paste(
-                stamp,
-                (
-                    stamp_x,
-                    stamp_y
-                ),
-                stamp
-            )
-
-        # ====================================================
-        # USERNAME
-        # ====================================================
-
-        username = truncate(
-            player.username,
-            20
-        )
-
-        text_center(
-            username,
-            center_x,
-            480,
-            card_font(
-                32,
-                True
-            ),
-            WHITE
-        )
-
-        # ====================================================
-        # NAME
-        # ====================================================
-
-        name = truncate(
-            player.name,
-            25
-        )
-
-        text_center(
-            name,
-            center_x,
-            530,
-            card_font(
-                21
-            ),
-            MUTED
-        )
-
-    # ========================================================
-    # SCORE BARS
-    # ========================================================
-
-    bar_left = 70
-    bar_right = 650
-
-    bar_left_2 = 790
-    bar_right_2 = 1370
-
-    bar_width = (
-        bar_right
-        -
-        bar_left
+        center_x,
+        150,
+        "HOST PROFILE",
+        winner == 0
     )
 
-    bar_height = 25
-
-    # 6 categories need more vertical space.
-    label_y = 630
-
-    for category_index, (
-        label,
-        key
-    ) in enumerate(
-        CATEGORIES
-    ):
-
-        y = (
-            label_y
-            +
-            category_index * 105
-        )
-
-        # ====================================================
-        # LEFT CATEGORY LABEL
-        # ====================================================
-
-        draw.text(
-            (
-                bar_left,
-                y
-            ),
-            label,
-            font=card_font(
-                24,
-                True
-            ),
-            fill=MUTED
-        )
-
-        # ====================================================
-        # RIGHT CATEGORY LABEL
-        # ====================================================
-
-        draw.text(
-            (
-                bar_left_2,
-                y
-            ),
-            label,
-            font=card_font(
-                24,
-                True
-            ),
-            fill=MUTED
-        )
-
-        for i, x in enumerate(
-            [
-                bar_left,
-                bar_left_2
-            ]
-        ):
-
-            score = result[
-                "players"
-            ][i][key]
-
-            bar_y = y + 48
-
-            actual_width = (
-                bar_width
-                *
-                score
-                /
-                10
-            )
-
-            # =================================================
-            # BACKGROUND BAR
-            # =================================================
-
-            draw.rounded_rectangle(
-                (
-                    x,
-                    bar_y,
-                    x + bar_width,
-                    bar_y + bar_height
-                ),
-                radius=12,
-                fill=BAR_BG
-            )
-
-            # =================================================
-            # SCORE BAR
-            # =================================================
-
-            if actual_width > 0:
-
-                draw.rounded_rectangle(
-                    (
-                        x,
-                        bar_y,
-                        x + actual_width,
-                        bar_y + bar_height
-                    ),
-                    radius=12,
-                    fill=YELLOW
-                )
-
-            # =================================================
-            # SCORE NUMBER
-            # =================================================
-
-            draw.text(
-                (
-                    x + bar_width + 15,
-                    bar_y - 7
-                ),
-                f"{score:.1f}",
-                font=card_font(
-                    24,
-                    True
-                ),
-                fill=WHITE
-            )
-
     # ========================================================
-    # OVERALL
+    # PLAYER 1 SCORES
     # ========================================================
 
-    overall_y = 1290
+    draw_score_section(
+        draw,
+        player1,
+        result["players"][0],
+        center_x,
+        620,
+        winner == 0
+    )
 
-    draw.text(
+    # ========================================================
+    # VS
+    # ========================================================
+
+    vs_y = 1110
+
+    # separator
+    draw.line(
         (
             70,
-            overall_y
+            vs_y + 52,
+            W - 70,
+            vs_y + 52
         ),
-        "OVERALL",
-        font=card_font(
-            29,
+        fill=BORDER,
+        width=2
+    )
+
+    # black rounded VS box
+    vs_w = 160
+    vs_h = 105
+
+    draw.rounded_rectangle(
+        (
+            center_x - vs_w // 2,
+            vs_y,
+            center_x + vs_w // 2,
+            vs_y + vs_h
+        ),
+        radius=35,
+        fill="#09090d"
+    )
+
+    text_center(
+        draw,
+        "VS",
+        center_x,
+        vs_y + 10,
+        get_font(
+            "vs",
             True
         ),
-        fill=MUTED
+        WHITE
     )
 
-    for i, x in enumerate(
-        [
-            bar_left,
-            bar_left_2
-        ]
-    ):
+    # ========================================================
+    # PLAYER 2 HEADER
+    # ========================================================
 
-        score = result[
-            "players"
-        ][i]["overall"]
+    draw_profile_header(
+        image,
+        draw,
+        player2,
+        center_x,
+        1240,
+        "GUEST PROFILE",
+        winner == 1
+    )
 
-        bar_y = (
-            overall_y
-            + 65
-        )
+    # ========================================================
+    # PLAYER 2 SCORES
+    # ========================================================
 
-        overall_bar_height = 45
+    draw_score_section(
+        draw,
+        player2,
+        result["players"][1],
+        center_x,
+        1710,
+        winner == 1
+    )
 
-        actual_width = (
-            bar_width
-            *
-            score
-            /
-            10
-        )
+    # ========================================================
+    # MOGGED STAMP
+    # ========================================================
 
-        # Background
+    if result["loser"] is not None:
 
-        draw.rounded_rectangle(
+        loser_center = center_x
+
+        stamp_w = 560
+        stamp_h = 120
+
+        stamp = Image.new(
+            "RGBA",
             (
-                x,
-                bar_y,
-                x + bar_width,
-                bar_y + overall_bar_height
+                stamp_w,
+                stamp_h
             ),
-            radius=22,
-            fill=PURPLE_DARK
-        )
-
-        # Purple score
-
-        if actual_width > 0:
-
-            draw.rounded_rectangle(
-                (
-                    x,
-                    bar_y,
-                    x + actual_width,
-                    bar_y + overall_bar_height
-                ),
-                radius=22,
-                fill=PURPLE
+            (
+                0,
+                0,
+                0,
+                0
             )
+        )
 
-        draw.text(
+        stamp_draw = ImageDraw.Draw(
+            stamp
+        )
+
+        stamp_draw.rounded_rectangle(
             (
-                x + bar_width + 15,
-                bar_y - 9
+                5,
+                5,
+                stamp_w - 5,
+                stamp_h - 5
             ),
-            f"{score:.2f}",
-            font=card_font(
-                31,
+            radius=18,
+            fill=(
+                255,
+                48,
+                48,
+                235
+            ),
+            outline=(
+                255,
+                255,
+                255,
+                220
+            ),
+            width=4
+        )
+
+        stamp_draw.text(
+            (
+                stamp_w // 2,
+                stamp_h // 2
+            ),
+            "MOGGED",
+            font=get_font(
+                "mogged",
                 True
             ),
-            fill=WHITE
+            fill="white",
+            anchor="mm",
+            stroke_width=3,
+            stroke_fill="#7d0000"
+        )
+
+        stamp = stamp.rotate(
+            -10,
+            expand=True,
+            resample=Image.Resampling.BICUBIC
+        )
+
+        stamp_x = (
+            loser_center
+            -
+            stamp.width // 2
+        )
+
+        # Put stamp over lower profile area.
+        stamp_y = 1590
+
+        image.paste(
+            stamp,
+            (
+                stamp_x,
+                stamp_y
+            ),
+            stamp
         )
 
     # ========================================================
-    # RESULT
+    # FINAL RESULT
     # ========================================================
 
-    result_y = 1440
+    final_y = 2200
+
+    # Canvas may need room.
+    # Because H is 2150, put result in lower area
+    # inside the second score panel instead.
+    final_y = 2020
+
+    draw.line(
+        (
+            70,
+            final_y,
+            W - 70,
+            final_y
+        ),
+        fill=BORDER,
+        width=2
+    )
+
+    # STATUS
+
+    status = result[
+        "status"
+    ]
 
     draw.text(
         (
             70,
-            result_y
+            final_y + 25
         ),
-        result["status"],
-        font=card_font(
-            31,
+        status,
+        font=get_font(
+            "status",
             True
         ),
         fill=RED
     )
 
-    if result["winner"] is None:
+    # WINNER
+
+    if winner is None:
 
         winner_text = "DRAW"
 
@@ -1736,65 +2327,117 @@ def create_card(
         winner_text = (
             "WINNER  "
             +
-            result["winner_name"]
+            (
+                player1.username
+                if winner == 0
+                else
+                player2.username
+            )
         )
 
     draw.text(
         (
             70,
-            result_y + 65
+            final_y + 70
         ),
         winner_text,
-        font=card_font(
-            44,
+        font=get_font(
+            "winner",
             True
         ),
         fill=PURPLE
+    )
+
+    # Difference
+
+    draw.text(
+        (
+            1050,
+            final_y + 35
+        ),
+        "DIFFERENCE",
+        font=get_font(
+            "difference_label",
+            True
+        ),
+        fill=MUTED
+    )
+
+    draw.text(
+        (
+            1050,
+            final_y + 68
+        ),
+        f"{result['difference']:.2f}",
+        font=get_font(
+            "difference_score",
+            True
+        ),
+        fill=YELLOW
     )
 
     # ========================================================
     # VERDICT
     # ========================================================
 
+    verdict_y = 2090
+
     verdict = str(
         result.get(
             "verdict",
             ""
         )
-    )
+    ).strip()
 
-    if len(verdict) > 110:
+    if verdict:
 
-        verdict = (
-            verdict[:107]
-            +
-            "..."
+        verdict = truncate_text(
+            verdict,
+            150
         )
 
-    draw.text(
-        (
-            70,
-            result_y + 145
-        ),
-        verdict,
-        font=card_font(
-            23
-        ),
-        fill=WHITE
-    )
+        lines = wrap_text(
+            draw,
+            verdict,
+            get_font(
+                "verdict"
+            ),
+            W - 140
+        )
+
+        lines = lines[:2]
+
+        for index, line in enumerate(
+            lines
+        ):
+
+            text_center(
+                draw,
+                line,
+                center_x,
+                verdict_y + index * 32,
+                get_font(
+                    "verdict",
+                    True
+                ),
+                WHITE
+            )
 
     # ========================================================
     # FOOTER
     # ========================================================
 
+    # Footer deliberately placed at bottom.
+    footer_y = H - 38
+
     draw.text(
         (
             70,
-            H - 65
+            footer_y
         ),
         "MOG AI  •  POWERED BY GEMINI",
-        font=card_font(
-            18,
+        font=get_font(
+            "footer",
             True
         ),
         fill=MUTED
@@ -1956,10 +2599,12 @@ async def run_mog(
     status_message = await message.answer(
         "⚔️ <b>MOG BATTLE</b>\n\n"
         "🔎 Получаю профили...\n"
-        "🖼 Анализирую аватары...\n"
-        "📝 Анализирую bio...\n"
-        "🔤 Анализирую username...\n"
-        "👤 Анализирую name...\n"
+        "🖼 Загружаю аватары...\n"
+        "👤 Анализирую NAME...\n"
+        "🔤 Анализирую USERNAME...\n"
+        "📝 Анализирую BIO...\n"
+        "🔗 Анализирую COHERENCE...\n"
+        "✨ Анализирую VIBE...\n"
         "🧠 Gemini считает оценки..."
     )
 
@@ -2003,7 +2648,7 @@ async def run_mog(
         )
 
         # ====================================================
-        # SAVE STATS
+        # SAVE
         # ====================================================
 
         register_battle(
@@ -2013,7 +2658,7 @@ async def run_mog(
         )
 
         # ====================================================
-        # CREATE CARD
+        # CARD
         # ====================================================
 
         card = create_card(
@@ -2041,7 +2686,9 @@ async def run_mog(
             winner_text = (
                 "👑 <b>"
                 +
-                result["winner_name"]
+                html.escape(
+                    result["winner_name"]
+                )
                 +
                 "</b>"
             )
@@ -2049,10 +2696,10 @@ async def run_mog(
         caption = (
             "⚔️ <b>MOG BATTLE</b>\n\n"
 
-            f"{player1.username} "
+            f"{html.escape(player1.username)} "
             f"<b>{score1:.2f}/10</b>\n"
 
-            f"{player2.username} "
+            f"{html.escape(player2.username)} "
             f"<b>{score2:.2f}/10</b>\n\n"
 
             f"{winner_text}\n"
@@ -2060,11 +2707,12 @@ async def run_mog(
             f"📊 Difference: "
             f"<b>{result['difference']:.2f}</b>\n\n"
 
-            f"💬 {result['verdict']}"
+            f"💬 "
+            f"{html.escape(result['verdict'])}"
         )
 
         # ====================================================
-        # SEND CARD
+        # SEND
         # ====================================================
 
         await message.answer_photo(
@@ -2105,13 +2753,17 @@ async def run_mog(
                 "..."
             )
 
+        safe_error = html.escape(
+            error_text
+        )
+
         try:
 
             await status_message.edit_text(
                 "❌ <b>MOG FAILED</b>\n\n"
                 "<code>"
                 +
-                error_text
+                safe_error
                 +
                 "</code>"
             )
@@ -2122,7 +2774,7 @@ async def run_mog(
                 "❌ <b>MOG FAILED</b>\n\n"
                 "<code>"
                 +
-                error_text
+                safe_error
                 +
                 "</code>"
             )
@@ -2188,7 +2840,7 @@ async def start_command(
     await message.answer(
         "<b>⚔️ MOG AI</b>\n\n"
 
-        "Добро пожаловать в AI-баттлы профилей.\n\n"
+        "AI-баттлы Telegram-профилей.\n\n"
 
         "🥊 Ответь на сообщение человека:\n"
         "<code>.мог</code>\n\n"
@@ -2196,13 +2848,12 @@ async def start_command(
         "Или:\n"
         "<code>.мог @username</code>\n\n"
 
-        "Gemini оценит:\n"
-        "🖼 Avatar\n"
-        "🔤 Username\n"
-        "👤 Name\n"
-        "📝 Bio\n"
-        "🔗 Coherence\n"
-        "✨ Vibe\n\n"
+        "Gemini оценивает:\n"
+        "👤 NAME\n"
+        "🔤 USERNAME\n"
+        "📝 BIO\n"
+        "🔗 COHERENCE\n"
+        "✨ VIBE\n\n"
 
         "🏆 Побеждает тот, у кого выше Overall."
     )
@@ -2426,9 +3077,15 @@ async def top_command(
                 f"<b>{index + 1}.</b>"
             )
 
+        username = html.escape(
+            str(
+                user["username"]
+            )
+        )
+
         text += (
             f"{position} "
-            f"{user['username']} — "
+            f"{username} — "
             f"<b>{user['wins']}</b> wins "
             f"• {user['average']:.2f}/10\n"
         )
@@ -2487,19 +3144,53 @@ async def history_command(
 
             winner = "DRAW"
 
+        p1 = html.escape(
+            str(
+                battle["player1"]
+            )
+        )
+
+        p2 = html.escape(
+            str(
+                battle["player2"]
+            )
+        )
+
+        winner = html.escape(
+            str(winner)
+        )
+
         text += (
             f"⚔️ "
-            f"{battle['player1']} "
+            f"{p1} "
             f"<b>{battle['score1']:.2f}</b>"
             f" × "
             f"<b>{battle['score2']:.2f}</b> "
-            f"{battle['player2']}\n"
+            f"{p2}\n"
 
             f"🏆 {winner}\n\n"
         )
 
     await message.answer(
         text
+    )
+
+
+# ============================================================
+# DETAILS
+# ============================================================
+
+@dp.callback_query(
+    F.data == "details"
+)
+async def details_callback(
+    callback: CallbackQuery
+):
+
+    await callback.answer(
+        "Оценки NAME / USERNAME / BIO / "
+        "COHERENCE / VIBE находятся на карточке.",
+        show_alert=True
     )
 
 
@@ -2562,23 +3253,6 @@ async def rematch_callback(
 
 
 # ============================================================
-# DETAILS
-# ============================================================
-
-@dp.callback_query(
-    F.data == "details"
-)
-async def details_callback(
-    callback: CallbackQuery
-):
-
-    await callback.answer(
-        "Подробные оценки находятся на карточке.",
-        show_alert=True
-    )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
@@ -2591,11 +3265,6 @@ async def main():
     logger.info(
         "Gemini model: %s",
         GEMINI_MODEL
-    )
-
-    logger.info(
-        "Card font scale: %sx",
-        FONT_SCALE
     )
 
     bot = Bot(
@@ -2631,4 +3300,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         main()
-        )
+            )
