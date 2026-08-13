@@ -15,11 +15,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    BufferedInputFile,
-    CallbackQuery,
-)
+from aiogram.types import Message, BufferedInputFile, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
@@ -30,9 +26,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
+# Надёжный fallback.
+# Можно переопределить через ENV:
+# GEMINI_MODEL=gemini-3.5-flash
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.5-flash"
+    "gemini-2.5-flash"
+).strip()
+
+# Если основной model не сработал — пробуем этот.
+GEMINI_FALLBACK_MODEL = os.getenv(
+    "GEMINI_FALLBACK_MODEL",
+    "gemini-2.5-flash"
 ).strip()
 
 DATA_FILE = "mog_data.json"
@@ -86,7 +91,7 @@ CATEGORIES = [
 
 
 # ============================================================
-# CARD FONT SETTINGS
+# FONT SETTINGS
 # ============================================================
 
 FONT_SIZES = {
@@ -139,7 +144,7 @@ BAR_BG = "#292932"
 
 
 # ============================================================
-# PROFILE OBJECT
+# PROFILE
 # ============================================================
 
 class Profile:
@@ -328,13 +333,9 @@ def register_battle(
         "status": result["status"]
     }
 
-    data["battles"].append(
-        battle
-    )
+    data["battles"].append(battle)
 
-    data["battles"] = (
-        data["battles"][-500:]
-    )
+    data["battles"] = data["battles"][-500:]
 
     save_data(data)
 
@@ -348,9 +349,7 @@ async def get_profile(
     user_id: int
 ):
 
-    chat = await bot.get_chat(
-        user_id
-    )
+    chat = await bot.get_chat(user_id)
 
     username = (
         "@"
@@ -489,134 +488,448 @@ GEMINI_RESPONSE_SCHEMA = {
 
 
 # ============================================================
-# GEMINI JSON PARSER
+# JSON EXTRACTION
 # ============================================================
 
-def parse_gemini_json(text: str):
+def extract_json_object(text: str):
 
     if not text:
 
         raise ValueError(
-            "Gemini returned empty response."
+            "no JSON object: empty Gemini text"
         )
 
-    original = text
+    text = str(text).strip()
 
-    text = text.strip()
+    logger.info(
+        "Gemini raw text length: %s",
+        len(text)
+    )
+
+    logger.debug(
+        "Gemini raw text: %s",
+        text[:10000]
+    )
 
     # --------------------------------------------------------
-    # REMOVE MARKDOWN JSON FENCES
+    # 1. Direct JSON
     # --------------------------------------------------------
 
-    text = re.sub(
-        r"^```(?:json)?\s*",
+    try:
+
+        parsed = json.loads(text)
+
+        if isinstance(parsed, dict):
+
+            return parsed
+
+    except json.JSONDecodeError:
+
+        pass
+
+    # --------------------------------------------------------
+    # 2. Remove markdown fences
+    # --------------------------------------------------------
+
+    cleaned = re.sub(
+        r"^\s*```(?:json)?\s*",
         "",
         text,
         flags=re.IGNORECASE
     )
 
-    text = re.sub(
-        r"\s*```$",
+    cleaned = re.sub(
+        r"\s*```\s*$",
         "",
-        text
-    )
-
-    text = text.strip()
-
-    # --------------------------------------------------------
-    # FIRST ATTEMPT: PURE JSON
-    # --------------------------------------------------------
+        cleaned
+    ).strip()
 
     try:
 
-        result = json.loads(
-            text
-        )
+        parsed = json.loads(cleaned)
 
-        if isinstance(
-            result,
-            dict
-        ):
+        if isinstance(parsed, dict):
 
-            return result
+            return parsed
 
     except json.JSONDecodeError:
+
         pass
 
     # --------------------------------------------------------
-    # SECOND ATTEMPT:
-    # FIND JSON OBJECT INSIDE TEXT
+    # 3. Find balanced JSON object
+    #
+    # Не используем:
+    # re.search(r"\{.*\}")
+    #
+    # потому что это ломается на вложенных объектах.
     # --------------------------------------------------------
 
-    start = text.find("{")
-    end = text.rfind("}")
+    start = cleaned.find("{")
 
-    if (
-        start == -1
-        or
-        end == -1
-        or
-        end <= start
-    ):
+    while start != -1:
 
-        logger.error(
-            "Gemini response does not contain JSON object."
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(
+            start,
+            len(cleaned)
+        ):
+
+            char = cleaned[index]
+
+            if in_string:
+
+                if escaped:
+
+                    escaped = False
+
+                elif char == "\\":
+
+                    escaped = True
+
+                elif char == '"':
+
+                    in_string = False
+
+                continue
+
+            if char == '"':
+
+                in_string = True
+
+                continue
+
+            if char == "{":
+
+                depth += 1
+
+            elif char == "}":
+
+                depth -= 1
+
+                if depth == 0:
+
+                    candidate = cleaned[
+                        start:index + 1
+                    ]
+
+                    try:
+
+                        parsed = json.loads(
+                            candidate
+                        )
+
+                        if isinstance(
+                            parsed,
+                            dict
+                        ):
+
+                            return parsed
+
+                    except json.JSONDecodeError:
+
+                        pass
+
+                    break
+
+        start = cleaned.find(
+            "{",
+            start + 1
         )
 
-        logger.error(
-            "Gemini RAW RESPONSE: %r",
-            original[:10000]
-        )
-
-        raise RuntimeError(
-            "Gemini JSON parsing failed: no JSON object."
-        )
-
-    candidate = text[
-        start:end + 1
-    ]
-
-    try:
-
-        result = json.loads(
-            candidate
-        )
-
-    except json.JSONDecodeError as error:
-
-        logger.error(
-            "Gemini JSON parsing failed: %s",
-            error
-        )
-
-        logger.error(
-            "Gemini RAW RESPONSE: %r",
-            original[:10000]
-        )
-
-        logger.error(
-            "Gemini CLEANED RESPONSE: %r",
-            candidate[:10000]
-        )
-
-        raise RuntimeError(
-            "Gemini JSON parsing failed."
-        ) from error
-
-    if not isinstance(
-        result,
-        dict
-    ):
-
-        raise RuntimeError(
-            "Gemini JSON is not an object."
-        )
-
-    return result
+    raise ValueError(
+        "no JSON object"
+    )
 
 
 # ============================================================
-# GEMINI
+# GEMINI RESPONSE TEXT
+# ============================================================
+
+def extract_gemini_text(data):
+
+    candidates = data.get(
+        "candidates",
+        []
+    )
+
+    if not candidates:
+
+        prompt_feedback = data.get(
+            "promptFeedback"
+        )
+
+        logger.error(
+            "Gemini returned no candidates. "
+            "promptFeedback=%s",
+            json.dumps(
+                prompt_feedback,
+                ensure_ascii=False
+            )
+            if prompt_feedback
+            else "none"
+        )
+
+        return ""
+
+    candidate = candidates[0]
+
+    finish_reason = candidate.get(
+        "finishReason"
+    )
+
+    logger.info(
+        "Gemini finishReason=%s",
+        finish_reason
+    )
+
+    content = candidate.get(
+        "content"
+    ) or {}
+
+    parts = content.get(
+        "parts"
+    ) or []
+
+    text_parts = []
+
+    for part in parts:
+
+        if not isinstance(
+            part,
+            dict
+        ):
+
+            continue
+
+        text_value = part.get(
+            "text"
+        )
+
+        if isinstance(
+            text_value,
+            str
+        ):
+
+            text_parts.append(
+                text_value
+            )
+
+    text = "".join(
+        text_parts
+    ).strip()
+
+    return text
+
+
+# ============================================================
+# GEMINI REQUEST
+# ============================================================
+
+async def gemini_request(
+    client,
+    model,
+    payload,
+    headers
+):
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
+    )
+
+    response = None
+
+    for attempt in range(
+        GEMINI_MAX_RETRIES
+    ):
+
+        try:
+
+            response = await client.post(
+                url,
+                headers=headers,
+                json=payload
+            )
+
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError
+        ) as error:
+
+            logger.warning(
+                "Gemini network error "
+                "(model=%s attempt=%s/%s): %s",
+                model,
+                attempt + 1,
+                GEMINI_MAX_RETRIES,
+                error
+            )
+
+            if attempt >= GEMINI_MAX_RETRIES - 1:
+
+                raise RuntimeError(
+                    "Gemini network error."
+                ) from error
+
+            delay = 3 * (2 ** attempt)
+
+            await asyncio.sleep(
+                delay
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
+        if response.status_code == 200:
+
+            try:
+
+                data = response.json()
+
+            except Exception as error:
+
+                logger.error(
+                    "Gemini HTTP response is not JSON: %s",
+                    response.text[:5000]
+                )
+
+                raise RuntimeError(
+                    "Gemini returned invalid HTTP JSON."
+                ) from error
+
+            return data
+
+        # ----------------------------------------------------
+        # RATE LIMIT
+        # ----------------------------------------------------
+
+        if response.status_code == 429:
+
+            if attempt >= GEMINI_MAX_RETRIES - 1:
+
+                raise RuntimeError(
+                    "Gemini API rate limit exceeded. "
+                    "Попробуй немного позже."
+                )
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
+            if retry_after:
+
+                try:
+
+                    delay = float(
+                        retry_after
+                    )
+
+                except ValueError:
+
+                    delay = 3 * (2 ** attempt)
+
+            else:
+
+                delay = 3 * (2 ** attempt)
+
+            logger.warning(
+                "Gemini 429. "
+                "Retry %s/%s after %.1fs",
+                attempt + 1,
+                GEMINI_MAX_RETRIES,
+                delay
+            )
+
+            await asyncio.sleep(
+                delay
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # SERVER ERRORS
+        # ----------------------------------------------------
+
+        if response.status_code in (
+            500,
+            502,
+            503,
+            504
+        ):
+
+            if attempt >= GEMINI_MAX_RETRIES - 1:
+
+                logger.error(
+                    "Gemini server error: %s",
+                    response.text[:3000]
+                )
+
+                response.raise_for_status()
+
+            delay = 3 * (2 ** attempt)
+
+            logger.warning(
+                "Gemini server error %s. "
+                "Retry in %.1fs",
+                response.status_code,
+                delay
+            )
+
+            await asyncio.sleep(
+                delay
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # OTHER ERROR
+        # ----------------------------------------------------
+
+        logger.error(
+            "Gemini HTTP %s: %s",
+            response.status_code,
+            response.text[:5000]
+        )
+
+        try:
+
+            error_data = response.json()
+
+        except Exception:
+
+            error_data = None
+
+        if error_data:
+
+            error_message = (
+                error_data
+                .get("error", {})
+                .get("message")
+            )
+
+            if error_message:
+
+                raise RuntimeError(
+                    f"Gemini API error: {error_message}"
+                )
+
+        response.raise_for_status()
+
+    raise RuntimeError(
+        "Gemini request failed."
+    )
+
+
+# ============================================================
+# ANALYZE WITH GEMINI
 # ============================================================
 
 async def analyze_with_gemini(
@@ -694,7 +1007,34 @@ VIBE:
 Сделай короткий смешной русский вердикт,
 максимум 180 символов.
 
-Верни ТОЛЬКО JSON по заданной схеме.
+ВАЖНО:
+Ответ должен быть ОДНИМ валидным JSON-объектом.
+Никакого Markdown.
+Никаких ```json.
+Никакого текста до JSON.
+Никакого текста после JSON.
+
+Формат:
+
+{
+  "players": [
+    {
+      "name": 0.0,
+      "username": 0.0,
+      "bio": 0.0,
+      "coherence": 0.0,
+      "vibe": 0.0
+    },
+    {
+      "name": 0.0,
+      "username": 0.0,
+      "bio": 0.0,
+      "coherence": 0.0,
+      "vibe": 0.0
+    }
+  ],
+  "verdict": "короткий смешной вердикт"
+}
 """
 
     def profile_text(profile):
@@ -736,11 +1076,9 @@ VIBE:
             {
                 "inline_data": {
                     "mime_type": "image/jpeg",
-
-                    "data":
-                        base64.b64encode(
-                            player1.avatar
-                        ).decode("utf-8")
+                    "data": base64.b64encode(
+                        player1.avatar
+                    ).decode("utf-8")
                 }
             }
         )
@@ -771,11 +1109,9 @@ VIBE:
             {
                 "inline_data": {
                     "mime_type": "image/jpeg",
-
-                    "data":
-                        base64.b64encode(
-                            player2.avatar
-                        ).decode("utf-8")
+                    "data": base64.b64encode(
+                        player2.avatar
+                    ).decode("utf-8")
                 }
             }
         )
@@ -797,48 +1133,56 @@ VIBE:
         )
 
     # ========================================================
-    # GEMINI URL
-    # ========================================================
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{GEMINI_MODEL}:generateContent"
-    )
-
-    # ========================================================
     # PAYLOAD
     # ========================================================
 
     payload = {
         "contents": [
             {
+                "role": "user",
                 "parts": parts
             }
         ],
 
         "generationConfig": {
-
-            "responseMimeType":
-                "application/json",
+            "responseMimeType": "application/json",
 
             "responseJsonSchema":
                 GEMINI_RESPONSE_SCHEMA,
 
-            "temperature":
-                0,
+            "maxOutputTokens": 1000,
 
-            "maxOutputTokens":
-                1000
+            "temperature": 0.7
         }
     }
 
     headers = {
-        "Content-Type":
-            "application/json",
-
-        "x-goog-api-key":
-            GEMINI_API_KEY
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
     }
+
+    # ========================================================
+    # MODELS
+    # ========================================================
+
+    models = []
+
+    if GEMINI_MODEL:
+
+        models.append(
+            GEMINI_MODEL
+        )
+
+    if (
+        GEMINI_FALLBACK_MODEL
+        and
+        GEMINI_FALLBACK_MODEL
+        not in models
+    ):
+
+        models.append(
+            GEMINI_FALLBACK_MODEL
+        )
 
     # ========================================================
     # REQUEST
@@ -850,486 +1194,225 @@ VIBE:
             timeout=GEMINI_TIMEOUT
         ) as client:
 
-            response = None
+            last_error = None
 
-            for attempt in range(
-                GEMINI_MAX_RETRIES
-            ):
+            for model in models:
 
-                try:
+                # ------------------------------------------------
+                # Try the model.
+                # If HTTP succeeds but JSON is broken,
+                # retry the same model before fallback.
+                # ------------------------------------------------
 
-                    response = await client.post(
-                        url,
-                        headers=headers,
-                        json=payload
-                    )
+                for parse_attempt in range(2):
 
-                except (
-                    httpx.TimeoutException,
-                    httpx.ConnectError,
-                    httpx.RemoteProtocolError
-                ) as error:
+                    try:
 
-                    logger.warning(
-                        "Gemini network error: %s",
-                        error
-                    )
-
-                    if (
-                        attempt
-                        >=
-                        GEMINI_MAX_RETRIES - 1
-                    ):
-
-                        raise RuntimeError(
-                            "Gemini network error."
-                        ) from error
-
-                    delay = (
-                        3
-                        *
-                        (
-                            2 ** attempt
-                        )
-                    )
-
-                    await asyncio.sleep(
-                        delay
-                    )
-
-                    continue
-
-                # ====================================================
-                # SUCCESS
-                # ====================================================
-
-                if response.status_code == 200:
-
-                    break
-
-                # ====================================================
-                # RATE LIMIT
-                # ====================================================
-
-                if response.status_code == 429:
-
-                    if (
-                        attempt
-                        >=
-                        GEMINI_MAX_RETRIES - 1
-                    ):
-
-                        raise RuntimeError(
-                            "Gemini API rate limit exceeded. "
-                            "Попробуй немного позже."
+                        logger.info(
+                            "Calling Gemini model=%s "
+                            "parse_attempt=%s",
+                            model,
+                            parse_attempt + 1
                         )
 
-                    retry_after = (
-                        response.headers.get(
-                            "Retry-After"
+                        data = await gemini_request(
+                            client,
+                            model,
+                            payload,
+                            headers
                         )
-                    )
 
-                    if retry_after:
+                        # ----------------------------------------
+                        # Log safety/block reason if present
+                        # ----------------------------------------
 
-                        try:
+                        if data.get(
+                            "promptFeedback"
+                        ):
 
-                            delay = float(
-                                retry_after
+                            logger.info(
+                                "Gemini promptFeedback: %s",
+                                json.dumps(
+                                    data["promptFeedback"],
+                                    ensure_ascii=False
+                                )[:3000]
                             )
 
-                        except ValueError:
+                        # ----------------------------------------
+                        # Extract text
+                        # ----------------------------------------
 
-                            delay = (
-                                3
-                                *
-                                (
-                                    2 ** attempt
-                                )
+                        text = extract_gemini_text(
+                            data
+                        )
+
+                        if not text:
+
+                            logger.error(
+                                "Gemini returned no text. "
+                                "Full response: %s",
+                                json.dumps(
+                                    data,
+                                    ensure_ascii=False
+                                )[:10000]
                             )
 
-                    else:
-
-                        delay = (
-                            3
-                            *
-                            (
-                                2 ** attempt
+                            raise ValueError(
+                                "no JSON object: "
+                                "Gemini returned no text"
                             )
+
+                        logger.info(
+                            "Gemini response text: %s",
+                            text[:5000]
                         )
 
-                    logger.warning(
-                        "Gemini 429. "
-                        "Retry %s/%s after %.1fs",
-                        attempt + 1,
-                        GEMINI_MAX_RETRIES,
-                        delay
-                    )
+                        # ----------------------------------------
+                        # Parse
+                        # ----------------------------------------
 
-                    await asyncio.sleep(
-                        delay
-                    )
-
-                    continue
-
-                # ====================================================
-                # SERVER ERRORS
-                # ====================================================
-
-                if response.status_code in (
-                    500,
-                    502,
-                    503,
-                    504
-                ):
-
-                    if (
-                        attempt
-                        >=
-                        GEMINI_MAX_RETRIES - 1
-                    ):
-
-                        logger.error(
-                            "Gemini server error %s: %s",
-                            response.status_code,
-                            response.text[:3000]
+                        result = extract_json_object(
+                            text
                         )
 
-                        response.raise_for_status()
+                        # ----------------------------------------
+                        # Validate
+                        # ----------------------------------------
 
-                    delay = (
-                        3
-                        *
-                        (
-                            2 ** attempt
+                        validate_gemini_result(
+                            result
                         )
-                    )
 
-                    logger.warning(
-                        "Gemini server error %s. "
-                        "Retry in %.1fs",
-                        response.status_code,
-                        delay
-                    )
+                        logger.info(
+                            "Gemini JSON parsed successfully "
+                            "with model=%s",
+                            model
+                        )
 
-                    await asyncio.sleep(
-                        delay
-                    )
+                        return result
 
-                    continue
+                    except Exception as error:
 
-                # ====================================================
-                # OTHER HTTP ERROR
-                # ====================================================
+                        last_error = error
 
-                logger.error(
-                    "Gemini HTTP %s: %s",
-                    response.status_code,
-                    response.text[:5000]
-                )
+                        logger.warning(
+                            "Gemini parse/request attempt failed "
+                            "(model=%s attempt=%s): %s",
+                            model,
+                            parse_attempt + 1,
+                            error
+                        )
 
-                response.raise_for_status()
+                        if parse_attempt == 0:
 
-            else:
+                            await asyncio.sleep(1)
 
-                raise RuntimeError(
-                    "Gemini request failed."
-                )
+                            continue
 
-    # ========================================================
-    # PARSE HTTP RESPONSE
-    # ========================================================
+                        break
 
-    try:
-
-        data = response.json()
-
-    except Exception as error:
-
-        logger.error(
-            "Gemini returned non-JSON HTTP body:"
-        )
-
-        logger.error(
-            "%s",
-            response.text[:5000]
-        )
-
-        raise RuntimeError(
-            "Gemini returned invalid HTTP JSON."
-        ) from error
-
-    # ========================================================
-    # CHECK GEMINI API ERROR
-    # ========================================================
-
-    if "error" in data:
-
-        logger.error(
-            "Gemini API error: %s",
-            json.dumps(
-                data,
-                ensure_ascii=False
-            )[:5000]
-        )
-
-        error_message = (
-            data.get(
-                "error",
-                {}
-            ).get(
-                "message",
-                "Unknown Gemini API error."
-            )
-        )
-
-        raise RuntimeError(
-            f"Gemini API error: {error_message}"
-        )
-
-    # ========================================================
-    # GET MODEL TEXT
-    # ========================================================
-
-    try:
-
-        candidates = data.get(
-            "candidates",
-            []
-        )
-
-        if not candidates:
+            # ====================================================
+            # ALL FAILED
+            # ====================================================
 
             logger.error(
-                "Gemini response without candidates: %s",
-                json.dumps(
-                    data,
-                    ensure_ascii=False
-                )[:5000]
+                "All Gemini attempts failed. Last error: %s",
+                last_error
             )
 
             raise RuntimeError(
-                "Gemini returned no candidates."
+                f"Gemini JSON parsing failed: "
+                f"{last_error or 'unknown error'}"
             )
 
-        candidate = candidates[0]
 
-        content = candidate.get(
-            "content",
-            {}
-        )
+# ============================================================
+# VALIDATE GEMINI RESULT
+# ============================================================
 
-        response_parts = content.get(
-            "parts",
-            []
-        )
-
-        text_parts = []
-
-        for part in response_parts:
-
-            if (
-                isinstance(part, dict)
-                and
-                "text" in part
-            ):
-
-                text_parts.append(
-                    str(
-                        part["text"]
-                    )
-                )
-
-        text = "".join(
-            text_parts
-        ).strip()
-
-        # ----------------------------------------------------
-        # FINISH REASON
-        # ----------------------------------------------------
-
-        finish_reason = candidate.get(
-            "finishReason"
-        )
-
-        if finish_reason:
-
-            logger.info(
-                "Gemini finish reason: %s",
-                finish_reason
-            )
-
-    except RuntimeError:
-
-        raise
-
-    except Exception as error:
-
-        logger.error(
-            "Gemini response parsing error: %s",
-            error
-        )
-
-        logger.error(
-            "Gemini full response: %s",
-            json.dumps(
-                data,
-                ensure_ascii=False
-            )[:10000]
-        )
-
-        raise RuntimeError(
-            "Gemini returned an invalid response."
-        ) from error
-
-    if not text:
-
-        logger.error(
-            "Gemini returned empty text."
-        )
-
-        logger.error(
-            "Gemini full response: %s",
-            json.dumps(
-                data,
-                ensure_ascii=False
-            )[:10000]
-        )
-
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
-
-    # ========================================================
-    # LOG RAW RESPONSE
-    # ========================================================
-
-    logger.info(
-        "Gemini raw text: %r",
-        text[:10000]
-    )
-
-    # ========================================================
-    # PARSE JSON
-    # ========================================================
-
-    try:
-
-        result = parse_gemini_json(
-            text
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Gemini JSON parsing failed."
-        )
-
-        raise
-
-    # ========================================================
-    # VALIDATE TOP LEVEL
-    # ========================================================
+def validate_gemini_result(result):
 
     if not isinstance(
         result,
         dict
     ):
 
-        raise RuntimeError(
-            "Gemini result is not an object."
+        raise ValueError(
+            "Gemini result is not an object"
         )
 
     players = result.get(
         "players"
     )
 
-    if (
-        not isinstance(
-            players,
-            list
-        )
-        or
-        len(players) != 2
+    if not isinstance(
+        players,
+        list
     ):
 
-        logger.error(
-            "Invalid Gemini players: %r",
-            players
+        raise ValueError(
+            "Gemini players is not a list"
         )
 
-        raise RuntimeError(
-            "Gemini returned invalid players data."
+    if len(players) != 2:
+
+        raise ValueError(
+            f"Gemini returned {len(players)} players"
         )
 
-    # ========================================================
-    # SANITIZE SCORES
-    # ========================================================
-
-    for player_index, player in enumerate(
-        players
-    ):
+    for index, player in enumerate(players):
 
         if not isinstance(
             player,
             dict
         ):
 
-            raise RuntimeError(
-                "Gemini returned invalid player data."
+            raise ValueError(
+                f"Player {index + 1} is not an object"
             )
 
         for key in WEIGHTS:
 
+            if key not in player:
+
+                raise ValueError(
+                    f"Player {index + 1} "
+                    f"missing field: {key}"
+                )
+
             try:
 
                 value = float(
-                    player.get(
-                        key,
-                        0
-                    )
+                    player[key]
                 )
 
             except Exception:
 
-                logger.warning(
-                    "Invalid score from Gemini: player=%s key=%s value=%r",
-                    player_index,
-                    key,
-                    player.get(key)
+                raise ValueError(
+                    f"Player {index + 1} "
+                    f"field {key} is not numeric"
                 )
 
-                value = 0.0
+            if not 0 <= value <= 10:
 
-            if not (
-                value == value
-            ):
-                value = 0.0
-
-            player[key] = max(
-                0.0,
-                min(
-                    10.0,
-                    value
+                raise ValueError(
+                    f"Player {index + 1} "
+                    f"field {key} outside 0-10"
                 )
-            )
 
-    # ========================================================
-    # VERDICT
-    # ========================================================
-
-    result["verdict"] = str(
-        result.get(
-            "verdict",
-            "Нет вердикта."
-        )
-    )[:300]
-
-    logger.info(
-        "Gemini analysis successful."
+    verdict = result.get(
+        "verdict"
     )
 
-    return result
+    if verdict is None:
+
+        result["verdict"] = "MOG суд вынес вердикт."
+
+    else:
+
+        result["verdict"] = str(
+            verdict
+        )[:300]
 
 
 # ============================================================
@@ -1360,24 +1443,29 @@ def calculate_scores(
 
         for key in WEIGHTS:
 
-            scores[key] = float(
-                max(
-                    0,
-                    min(
-                        10,
-                        raw.get(
-                            key,
-                            0
-                        )
+            try:
+
+                value = float(
+                    raw.get(
+                        key,
+                        0
                     )
+                )
+
+            except Exception:
+
+                value = 0.0
+
+            scores[key] = max(
+                0.0,
+                min(
+                    10.0,
+                    value
                 )
             )
 
         overall = sum(
-            scores[key]
-            *
-            WEIGHTS[key]
-
+            scores[key] * WEIGHTS[key]
             for key in WEIGHTS
         )
 
@@ -1394,15 +1482,9 @@ def calculate_scores(
     score2 = players[1]["overall"]
 
     difference = round(
-        abs(
-            score1 - score2
-        ),
+        abs(score1 - score2),
         2
     )
-
-    # ========================================================
-    # RESULT
-    # ========================================================
 
     if difference < 0.10:
 
@@ -1451,31 +1533,18 @@ def calculate_scores(
     )
 
     return {
-        "players":
-            players,
-
-        "winner":
-            winner,
-
-        "loser":
-            loser,
-
-        "winner_name":
-            winner_name,
-
-        "difference":
-            difference,
-
-        "status":
-            status,
-
-        "verdict":
-            str(
-                ai_result.get(
-                    "verdict",
-                    "Нет вердикта."
-                )
-            )[:300]
+        "players": players,
+        "winner": winner,
+        "loser": loser,
+        "winner_name": winner_name,
+        "difference": difference,
+        "status": status,
+        "verdict": str(
+            ai_result.get(
+                "verdict",
+                "Нет вердикта."
+            )
+        )[:300]
     }
 
 
@@ -1575,11 +1644,8 @@ def truncate_text(
         return text
 
     return (
-        text[
-            :max_chars - 1
-        ]
-        +
-        "…"
+        text[:max_chars - 1]
+        + "…"
     )
 
 
@@ -1620,10 +1686,9 @@ def wrap_text(
     max_width
 ):
 
-    words = (
-        str(text or "")
-        .split()
-    )
+    words = str(
+        text or ""
+    ).split()
 
     if not words:
 
@@ -1637,9 +1702,7 @@ def wrap_text(
         candidate = (
             word
             if not current
-            else current
-            + " "
-            + word
+            else current + " " + word
         )
 
         bbox = draw.textbbox(
@@ -1704,13 +1767,9 @@ def make_avatar(
 
             avatar = Image.open(
                 io.BytesIO(data)
-            ).convert(
-                "RGB"
-            )
+            ).convert("RGB")
 
-            width, height = (
-                avatar.size
-            )
+            width, height = avatar.size
 
             side = min(
                 width,
@@ -1922,9 +1981,7 @@ def draw_profile_header(
     )
 
     avatar_x = (
-        center_x
-        -
-        avatar_size // 2
+        center_x - avatar_size // 2
     )
 
     avatar_y = y + 50
@@ -1938,13 +1995,11 @@ def draw_profile_header(
         avatar
     )
 
-    if player_index == 0:
-
-        label = "HOST PROFILE"
-
-    else:
-
-        label = "GUEST PROFILE"
+    label = (
+        "HOST PROFILE"
+        if player_index == 0
+        else "GUEST PROFILE"
+    )
 
     label_font = f(
         "profile_label",
@@ -1955,9 +2010,7 @@ def draw_profile_header(
     label_box_h = 48
 
     label_x = (
-        center_x
-        -
-        label_box_w // 2
+        center_x - label_box_w // 2
     )
 
     label_y = y + 330
@@ -2095,11 +2148,7 @@ def draw_score_panel(
         badge_h = 48
 
         badge_x = (
-            panel_right
-            -
-            badge_w
-            -
-            38
+            panel_right - badge_w - 38
         )
 
         badge_y = y + 27
@@ -2128,15 +2177,11 @@ def draw_score_panel(
         )
 
     label_x = panel_left + 38
-
     bar_x = 300
-
     bar_width = 550
-
     score_x = 885
 
     first_y = y + 145
-
     row_gap = 82
 
     for index, (
@@ -2441,9 +2486,7 @@ def create_card(
         stamp = create_mogged_stamp()
 
         stamp_x = (
-            center_x
-            -
-            stamp.width // 2
+            center_x - stamp.width // 2
         )
 
         stamp_y = 2145
@@ -2507,14 +2550,12 @@ def create_card(
         YELLOW
     )
 
-    difference_label = "Разрыв"
-
     draw.text(
         (
             70,
             result_y + 120
         ),
-        difference_label,
+        "Разрыв",
         font=f(
             "difference_label",
             True
@@ -2535,15 +2576,12 @@ def create_card(
         fill=YELLOW
     )
 
-    verdict = (
-        str(
-            result.get(
-                "verdict",
-                ""
-            )
+    verdict = str(
+        result.get(
+            "verdict",
+            ""
         )
-        .strip()
-    )
+    ).strip()
 
     verdict = truncate_text(
         verdict,
@@ -2560,11 +2598,7 @@ def create_card(
         W - 130
     )
 
-    verdict_y = (
-        result_y
-        +
-        175
-    )
+    verdict_y = result_y + 175
 
     for line in verdict_lines[:2]:
 
@@ -2678,9 +2712,7 @@ async def resolve_target(
         try:
 
             target = await bot.get_chat(
-                "@"
-                +
-                username
+                "@" + username
             )
 
             return (
@@ -2733,10 +2765,6 @@ async def run_mog(
 
     try:
 
-        # ====================================================
-        # PROFILES
-        # ====================================================
-
         player1 = await get_profile(
             bot,
             player1_id
@@ -2747,18 +2775,10 @@ async def run_mog(
             player2_id
         )
 
-        # ====================================================
-        # AI
-        # ====================================================
-
         ai_result = await analyze_with_gemini(
             player1,
             player2
         )
-
-        # ====================================================
-        # SCORES
-        # ====================================================
 
         result = calculate_scores(
             ai_result,
@@ -2768,19 +2788,11 @@ async def run_mog(
             ]
         )
 
-        # ====================================================
-        # SAVE
-        # ====================================================
-
         register_battle(
             player1,
             player2,
             result
         )
-
-        # ====================================================
-        # CARD
-        # ====================================================
 
         card = create_card(
             player1,
@@ -2798,9 +2810,7 @@ async def run_mog(
 
         if result["winner"] is None:
 
-            winner_text = (
-                "🤝 <b>DRAW</b>"
-            )
+            winner_text = "🤝 <b>DRAW</b>"
 
         else:
 
@@ -2862,10 +2872,10 @@ async def run_mog(
             error
         )
 
-        if len(error_text) > 900:
+        if len(error_text) > 1200:
 
             error_text = (
-                error_text[:900]
+                error_text[:1200]
                 +
                 "..."
             )
@@ -2898,7 +2908,7 @@ async def run_mog(
 
 
 # ============================================================
-# .МОГ / /MOG
+# MOG COMMAND
 # ============================================================
 
 @dp.message(
@@ -3341,8 +3351,13 @@ async def main():
     )
 
     logger.info(
-        "Gemini model: %s",
+        "Gemini primary model: %s",
         GEMINI_MODEL
+    )
+
+    logger.info(
+        "Gemini fallback model: %s",
+        GEMINI_FALLBACK_MODEL
     )
 
     bot = Bot(
