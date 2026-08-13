@@ -29,17 +29,18 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = 8904429775
+# ЕДИНСТВЕННЫЙ человек, который может менять Gemini settings
+SETTINGS_ADMIN_ID = 8904429775
 
-DATA_FILE = "mog_data.json"
 SETTINGS_FILE = "mog_settings.json"
-
-GEMINI_MAX_RETRIES = 3
-GEMINI_TIMEOUT = 120
-
-GEMINI_SEMAPHORE = asyncio.Semaphore(2)
+DATA_FILE = "mog_data.json"
 
 DEFAULT_MODEL = "gemini-2.5-flash"
+
+GEMINI_TIMEOUT = 120
+GEMINI_MAX_RETRIES_PER_KEY = 2
+
+GEMINI_SEMAPHORE = asyncio.Semaphore(2)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -51,7 +52,7 @@ if not BOT_TOKEN:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger("mog_ai")
@@ -60,24 +61,926 @@ dp = Dispatcher()
 
 
 # ============================================================
-# GLOBAL USER STATE
+# SETTINGS
 # ============================================================
 
-# Здесь хранится состояние владельца:
-#
-# {
-#   8904429775: "waiting_api_key",
-#   8904429775: "waiting_model"
-# }
-#
-# Это решает проблему:
-# "Отправь API key" -> следующее сообщение ничего не делает.
+settings_lock = asyncio.Lock()
 
-USER_STATES = {}
+
+def default_settings():
+    return {
+        "gemini_keys": [],
+        "gemini_model": DEFAULT_MODEL,
+        "active_key": 0,
+    }
+
+
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return default_settings()
+
+    try:
+        with open(
+            SETTINGS_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            return default_settings()
+
+        data.setdefault("gemini_keys", [])
+        data.setdefault("gemini_model", DEFAULT_MODEL)
+        data.setdefault("active_key", 0)
+
+        if not isinstance(data["gemini_keys"], list):
+            data["gemini_keys"] = []
+
+        # Удаляем пустые ключи
+        data["gemini_keys"] = [
+            str(key).strip()
+            for key in data["gemini_keys"]
+            if str(key).strip()
+        ]
+
+        if not data["gemini_model"]:
+            data["gemini_model"] = DEFAULT_MODEL
+
+        if not isinstance(data["active_key"], int):
+            data["active_key"] = 0
+
+        if data["gemini_keys"]:
+            data["active_key"] %= len(data["gemini_keys"])
+        else:
+            data["active_key"] = 0
+
+        return data
+
+    except Exception:
+        logger.exception("Failed to load settings")
+        return default_settings()
+
+
+def save_settings(data):
+    temporary_file = SETTINGS_FILE + ".tmp"
+
+    with open(
+        temporary_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            data,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(
+        temporary_file,
+        SETTINGS_FILE,
+    )
+
+
+def is_settings_admin(message: Message):
+    return (
+        message.from_user
+        and
+        message.from_user.id == SETTINGS_ADMIN_ID
+    )
+
+
+def mask_key(key):
+    key = str(key)
+
+    if len(key) <= 10:
+        return "••••••••"
+
+    return (
+        key[:6]
+        +
+        "..."
+        +
+        key[-4:]
+    )
+
+
+def get_gemini_config():
+    data = load_settings()
+
+    keys = data.get("gemini_keys", [])
+    model = str(
+        data.get(
+            "gemini_model",
+            DEFAULT_MODEL,
+        )
+    ).strip()
+
+    if not model:
+        model = DEFAULT_MODEL
+
+    return keys, model
 
 
 # ============================================================
-# SCORING
+# SETTINGS KEYBOARD
+# ============================================================
+
+def settings_keyboard():
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="🔑 Добавить API key",
+        callback_data="settings:add_key",
+    )
+
+    builder.button(
+        text="📋 API keys",
+        callback_data="settings:list_keys",
+    )
+
+    builder.button(
+        text="🗑 Удалить API key",
+        callback_data="settings:delete_key",
+    )
+
+    builder.button(
+        text="🤖 Изменить модель",
+        callback_data="settings:model",
+    )
+
+    builder.button(
+        text="🔄 Проверить ключи",
+        callback_data="settings:test_keys",
+    )
+
+    builder.button(
+        text="❌ Закрыть",
+        callback_data="settings:close",
+    )
+
+    builder.adjust(
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+    )
+
+    return builder.as_markup()
+
+
+# ============================================================
+# SETTINGS STATE
+# ============================================================
+
+settings_waiting = {}
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        return {
+            "users": {},
+            "battles": [],
+        }
+
+    try:
+        with open(
+            DATA_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data, dict):
+            return {
+                "users": {},
+                "battles": [],
+            }
+
+        data.setdefault("users", {})
+        data.setdefault("battles", [])
+
+        return data
+
+    except Exception:
+        logger.exception("Failed to load database")
+
+        return {
+            "users": {},
+            "battles": [],
+        }
+
+
+def save_data(data):
+    temporary_file = DATA_FILE + ".tmp"
+
+    try:
+        with open(
+            temporary_file,
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        os.replace(
+            temporary_file,
+            DATA_FILE,
+        )
+
+    except Exception:
+        logger.exception("Failed to save database")
+
+
+def ensure_user(
+    data,
+    user_id,
+    username,
+):
+    user_id = str(user_id)
+
+    if user_id not in data["users"]:
+        data["users"][user_id] = {
+            "username": username,
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "battles": 0,
+            "score_sum": 0.0,
+        }
+
+    else:
+        data["users"][user_id]["username"] = username
+
+
+def register_battle(
+    player1,
+    player2,
+    result,
+):
+    data = load_data()
+
+    ensure_user(
+        data,
+        player1.user_id,
+        player1.username,
+    )
+
+    ensure_user(
+        data,
+        player2.user_id,
+        player2.username,
+    )
+
+    p1 = data["users"][str(player1.user_id)]
+    p2 = data["users"][str(player2.user_id)]
+
+    score1 = result["players"][0]["overall"]
+    score2 = result["players"][1]["overall"]
+
+    p1["battles"] += 1
+    p2["battles"] += 1
+
+    p1["score_sum"] += score1
+    p2["score_sum"] += score2
+
+    if result["winner"] == 0:
+        p1["wins"] += 1
+        p2["losses"] += 1
+
+    elif result["winner"] == 1:
+        p2["wins"] += 1
+        p1["losses"] += 1
+
+    else:
+        p1["draws"] += 1
+        p2["draws"] += 1
+
+    battle = {
+        "time": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "player1": player1.username,
+        "player2": player2.username,
+        "score1": score1,
+        "score2": score2,
+        "winner": result["winner"],
+        "status": result["status"],
+    }
+
+    data["battles"].append(battle)
+    data["battles"] = data["battles"][-500:]
+
+    save_data(data)
+
+
+# ============================================================
+# PROFILE
+# ============================================================
+
+class Profile:
+
+    def __init__(
+        self,
+        user_id,
+        username,
+        name,
+        bio,
+        avatar,
+    ):
+        self.user_id = user_id
+        self.username = username
+        self.name = name
+        self.bio = bio
+        self.avatar = avatar
+
+
+async def get_profile(
+    bot: Bot,
+    user_id: int,
+):
+    chat = await bot.get_chat(user_id)
+
+    username = (
+        "@"
+        + chat.username
+        if chat.username
+        else "no_username"
+    )
+
+    name = (
+        chat.full_name
+        or "Unknown"
+    )
+
+    bio = (
+        getattr(
+            chat,
+            "bio",
+            "",
+        )
+        or ""
+    )
+
+    avatar = None
+
+    try:
+        photos = await bot.get_user_profile_photos(
+            user_id=user_id,
+            limit=1,
+        )
+
+        if photos.total_count:
+            photo = photos.photos[0][-1]
+
+            telegram_file = await bot.get_file(
+                photo.file_id,
+            )
+
+            buffer = io.BytesIO()
+
+            await bot.download_file(
+                telegram_file.file_path,
+                buffer,
+            )
+
+            avatar = buffer.getvalue()
+
+    except Exception as error:
+        logger.warning(
+            "Avatar error for %s: %s",
+            user_id,
+            error,
+        )
+
+    return Profile(
+        user_id=user_id,
+        username=username,
+        name=name,
+        bio=bio,
+        avatar=avatar,
+    )
+
+
+# ============================================================
+# GEMINI SCHEMA
+# ============================================================
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "players": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                    "username": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                    "bio": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                    "coherence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                    "vibe": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                    },
+                },
+                "required": [
+                    "name",
+                    "username",
+                    "bio",
+                    "coherence",
+                    "vibe",
+                ],
+            },
+        },
+        "verdict": {
+            "type": "string",
+        },
+    },
+    "required": [
+        "players",
+        "verdict",
+    ],
+}
+
+
+# ============================================================
+# GEMINI JSON EXTRACTION
+# ============================================================
+
+def extract_json_object(text):
+    text = str(text or "").strip()
+
+    if not text:
+        raise RuntimeError(
+            "Gemini returned empty text."
+        )
+
+    # Сначала пробуем чистый JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Убираем markdown fences
+    cleaned = re.sub(
+        r"```(?:json)?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    cleaned = cleaned.rstrip("`").strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Ищем объект по балансировке скобок
+    start = cleaned.find("{")
+
+    if start == -1:
+        raise RuntimeError(
+            "Gemini JSON parsing failed: no JSON object."
+        )
+
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for index in range(
+        start,
+        len(cleaned),
+    ):
+        char = cleaned[index]
+
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+
+            continue
+
+        if char == '"':
+            in_string = True
+
+        elif char == "{":
+            depth += 1
+
+        elif char == "}":
+            depth -= 1
+
+            if depth == 0:
+                candidate = cleaned[
+                    start:index + 1
+                ]
+
+                try:
+                    return json.loads(
+                        candidate
+                    )
+                except json.JSONDecodeError:
+                    break
+
+    raise RuntimeError(
+        "Gemini JSON parsing failed: no valid JSON object."
+    )
+
+
+# ============================================================
+# GEMINI SINGLE REQUEST
+# ============================================================
+
+async def gemini_request(
+    api_key,
+    model,
+    player1,
+    player2,
+):
+    prompt = """
+Ты — AI-судья юмористической игры MOG BATTLE.
+
+Сравни два Telegram-профиля.
+
+Оценивай исключительно оформление профиля,
+а не личность человека.
+
+Нужно РОВНО ПЯТЬ оценок:
+
+1. NAME
+2. USERNAME
+3. BIO
+4. COHERENCE
+5. VIBE
+
+Каждая оценка от 0.0 до 10.0.
+
+NAME:
+качество отображаемого имени, читаемость,
+стиль, оригинальность и запоминаемость.
+
+USERNAME:
+читаемость, запоминаемость, оригинальность,
+простота и визуальный стиль.
+
+BIO:
+качество текста, краткость, оригинальность,
+характер и оформление.
+
+Если bio отсутствует — не выдумывай его.
+
+COHERENCE:
+сочетание NAME + USERNAME + BIO + AVATAR.
+
+VIBE:
+общая атмосфера, стиль, цельность,
+характер и запоминаемость профиля.
+
+Аватар учитывай только в COHERENCE и VIBE.
+
+Не оценивай и не делай выводы о:
+расе, этничности, религии, политике,
+сексуальной ориентации, здоровье,
+инвалидности, теле, физической привлекательности,
+точном возрасте или других чувствительных
+персональных характеристиках.
+
+Не выдумывай информацию.
+
+Используй диапазон 0-10.
+
+Сделай короткий смешной русский вердикт,
+максимум 180 символов.
+
+Верни ТОЛЬКО JSON по схеме.
+"""
+
+    def profile_text(profile):
+        return (
+            f"\nUSERNAME: {profile.username}"
+            f"\nNAME: {profile.name}"
+            f"\nBIO: {profile.bio or '(нет bio)'}"
+        )
+
+    parts = [
+        {
+            "text": prompt,
+        },
+        {
+            "text": (
+                "\n\nPLAYER 1"
+                +
+                profile_text(player1)
+            ),
+        },
+        {
+            "text": (
+                "\n\nPLAYER 2"
+                +
+                profile_text(player2)
+            ),
+        },
+    ]
+
+    if player1.avatar:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(
+                        player1.avatar
+                    ).decode("utf-8"),
+                },
+            }
+        )
+
+        parts.append(
+            {
+                "text": (
+                    "Это изображение — "
+                    "AVATAR PLAYER 1."
+                ),
+            }
+        )
+    else:
+        parts.append(
+            {
+                "text": (
+                    "PLAYER 1 не имеет аватара."
+                ),
+            }
+        )
+
+    if player2.avatar:
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": "image/jpeg",
+                    "data": base64.b64encode(
+                        player2.avatar
+                    ).decode("utf-8"),
+                },
+            }
+        )
+
+        parts.append(
+            {
+                "text": (
+                    "Это изображение — "
+                    "AVATAR PLAYER 2."
+                ),
+            }
+        )
+    else:
+        parts.append(
+            {
+                "text": (
+                    "PLAYER 2 не имеет аватара."
+                ),
+            }
+        )
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
+    )
+
+    payload = {
+        "contents": [
+            {
+                "parts": parts,
+            },
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": GEMINI_RESPONSE_SCHEMA,
+            "maxOutputTokens": 1000,
+        },
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+
+    async with httpx.AsyncClient(
+        timeout=GEMINI_TIMEOUT,
+    ) as client:
+
+        response = await client.post(
+            url,
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        error_body = response.text[:2000]
+
+        raise RuntimeError(
+            f"Gemini API error {response.status_code}: "
+            f"{error_body}"
+        )
+
+    try:
+        data = response.json()
+    except Exception as error:
+        raise RuntimeError(
+            "Gemini returned invalid HTTP JSON."
+        ) from error
+
+    candidates = data.get(
+        "candidates",
+        [],
+    )
+
+    if not candidates:
+        raise RuntimeError(
+            "Gemini returned no candidates."
+        )
+
+    content = candidates[0].get(
+        "content",
+        {},
+    )
+
+    response_parts = content.get(
+        "parts",
+        [],
+    )
+
+    text_parts = []
+
+    for part in response_parts:
+        if "text" in part:
+            text_parts.append(
+                str(part["text"])
+            )
+
+    text = "".join(
+        text_parts
+    ).strip()
+
+    if not text:
+        raise RuntimeError(
+            "Gemini returned empty response."
+        )
+
+    logger.info(
+        "Gemini raw response: %s",
+        text[:1500],
+    )
+
+    result = extract_json_object(text)
+
+    if not isinstance(result, dict):
+        raise RuntimeError(
+            "Gemini result is not an object."
+        )
+
+    return result
+
+
+# ============================================================
+# GEMINI WITH FALLBACK KEYS
+# ============================================================
+
+async def analyze_with_gemini(
+    player1,
+    player2,
+):
+    keys, model = get_gemini_config()
+
+    if not keys:
+        raise RuntimeError(
+            "Нет Gemini API keys. "
+            "Администратор должен добавить ключ "
+            "через /settings."
+        )
+
+    errors = []
+
+    async with GEMINI_SEMAPHORE:
+
+        settings = load_settings()
+
+        start_index = settings.get(
+            "active_key",
+            0,
+        )
+
+        if start_index >= len(keys):
+            start_index = 0
+
+        ordered_keys = (
+            keys[start_index:]
+            +
+            keys[:start_index]
+        )
+
+        for key_index, api_key in enumerate(
+            ordered_keys
+        ):
+            for attempt in range(
+                GEMINI_MAX_RETRIES_PER_KEY
+            ):
+                try:
+                    logger.info(
+                        "Gemini request using key %s/%s, model=%s",
+                        key_index + 1,
+                        len(ordered_keys),
+                        model,
+                    )
+
+                    result = await gemini_request(
+                        api_key,
+                        model,
+                        player1,
+                        player2,
+                    )
+
+                    # Успешный ключ становится активным
+                    original_index = (
+                        start_index
+                        +
+                        key_index
+                    ) % len(keys)
+
+                    settings["active_key"] = (
+                        original_index
+                    )
+
+                    save_settings(settings)
+
+                    return result
+
+                except Exception as error:
+                    error_text = str(error)
+
+                    logger.warning(
+                        "Gemini key %s attempt %s failed: %s",
+                        key_index + 1,
+                        attempt + 1,
+                        error_text,
+                    )
+
+                    errors.append(
+                        f"key {key_index + 1}: "
+                        f"{error_text[:300]}"
+                    )
+
+                    # Если это обычная ошибка — пробуем ещё раз
+                    if attempt < (
+                        GEMINI_MAX_RETRIES_PER_KEY - 1
+                    ):
+                        await asyncio.sleep(
+                            2 ** attempt
+                        )
+
+            # Переходим к следующему ключу
+            continue
+
+    raise RuntimeError(
+        "Все Gemini API keys не сработали.\n"
+        +
+        "\n".join(errors[-10:])
+    )
+
+
+# ============================================================
+# SCORE
 # ============================================================
 
 WEIGHTS = {
@@ -97,1199 +1000,19 @@ CATEGORIES = [
 ]
 
 
-# ============================================================
-# CARD FONT SETTINGS
-# ============================================================
-
-FONT_SIZES = {
-    "title": 58,
-    "subtitle": 22,
-
-    "profile_label": 23,
-    "profile_name": 42,
-    "profile_username": 27,
-
-    "overall_label": 22,
-    "overall_score": 36,
-
-    "category": 24,
-    "category_score": 24,
-
-    "vs": 70,
-    "stamp": 56,
-
-    "status": 35,
-    "winner": 34,
-    "difference_label": 23,
-    "difference_score": 31,
-
-    "verdict": 25,
-    "footer": 17,
-}
-
-
-# ============================================================
-# COLORS
-# ============================================================
-
-BG = "#09090d"
-PANEL = "#111118"
-PANEL_2 = "#17171f"
-BORDER = "#24242d"
-
-WHITE = "#f4f4f7"
-MUTED = "#858591"
-
-YELLOW = "#f4c542"
-PURPLE = "#8b5cf6"
-PURPLE_DARK = "#241a3d"
-
-RED = "#ef3030"
-RED_DARK = "#8b1010"
-
-BAR_BG = "#292932"
-
-
-# ============================================================
-# PROFILE
-# ============================================================
-
-class Profile:
-
-    def __init__(
-        self,
-        user_id,
-        username,
-        name,
-        bio,
-        avatar
-    ):
-        self.user_id = user_id
-        self.username = username
-        self.name = name
-        self.bio = bio
-        self.avatar = avatar
-
-
-# ============================================================
-# SETTINGS DATABASE
-# ============================================================
-
-def default_settings():
-
-    return {
-        "api_keys": [],
-        "model": DEFAULT_MODEL
-    }
-
-
-def load_settings():
-
-    if not os.path.exists(SETTINGS_FILE):
-
-        return default_settings()
-
-    try:
-
-        with open(
-            SETTINGS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if not isinstance(data, dict):
-
-            return default_settings()
-
-        data.setdefault(
-            "api_keys",
-            []
-        )
-
-        data.setdefault(
-            "model",
-            DEFAULT_MODEL
-        )
-
-        if not isinstance(
-            data["api_keys"],
-            list
-        ):
-
-            data["api_keys"] = []
-
-        # Удаляем мусор
-        clean_keys = []
-
-        for key in data["api_keys"]:
-
-            if isinstance(
-                key,
-                str
-            ):
-
-                key = key.strip()
-
-                if key and key not in clean_keys:
-
-                    clean_keys.append(key)
-
-        data["api_keys"] = clean_keys
-
-        return data
-
-    except Exception:
-
-        logger.exception(
-            "Failed to load settings"
-        )
-
-        return default_settings()
-
-
-def save_settings(
-    settings
-):
-
-    temporary_file = (
-        SETTINGS_FILE
-        +
-        ".tmp"
-    )
-
-    try:
-
-        with open(
-            temporary_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                settings,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            temporary_file,
-            SETTINGS_FILE
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Failed to save settings"
-        )
-
-
-# ============================================================
-# OWNER CHECK
-# ============================================================
-
-def is_owner(
-    user_id
-):
-
-    return int(user_id) == OWNER_ID
-
-
-# ============================================================
-# MASK API KEY
-# ============================================================
-
-def mask_api_key(
-    key
-):
-
-    key = str(key)
-
-    if len(key) <= 12:
-
-        return "*" * len(key)
-
-    return (
-        key[:6]
-        +
-        "..."
-        +
-        key[-6:]
-    )
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-def load_data():
-
-    if not os.path.exists(DATA_FILE):
-
-        return {
-            "users": {},
-            "battles": []
-        }
-
-    try:
-
-        with open(
-            DATA_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if not isinstance(
-            data,
-            dict
-        ):
-
-            return {
-                "users": {},
-                "battles": []
-            }
-
-        data.setdefault(
-            "users",
-            {}
-        )
-
-        data.setdefault(
-            "battles",
-            []
-        )
-
-        return data
-
-    except Exception:
-
-        logger.exception(
-            "Failed to load database"
-        )
-
-        return {
-            "users": {},
-            "battles": []
-        }
-
-
-def save_data(
-    data
-):
-
-    temporary_file = (
-        DATA_FILE
-        +
-        ".tmp"
-    )
-
-    try:
-
-        with open(
-            temporary_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=2
-            )
-
-        os.replace(
-            temporary_file,
-            DATA_FILE
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Failed to save database"
-        )
-
-
-def ensure_user(
-    data,
-    user_id,
-    username
-):
-
-    user_id = str(
-        user_id
-    )
-
-    if user_id not in data["users"]:
-
-        data["users"][user_id] = {
-            "username": username,
-            "wins": 0,
-            "losses": 0,
-            "draws": 0,
-            "battles": 0,
-            "score_sum": 0.0
-        }
-
-    else:
-
-        data["users"][user_id]["username"] = username
-
-
-def register_battle(
-    player1,
-    player2,
-    result
-):
-
-    data = load_data()
-
-    ensure_user(
-        data,
-        player1.user_id,
-        player1.username
-    )
-
-    ensure_user(
-        data,
-        player2.user_id,
-        player2.username
-    )
-
-    p1 = data["users"][
-        str(player1.user_id)
-    ]
-
-    p2 = data["users"][
-        str(player2.user_id)
-    ]
-
-    score1 = result["players"][0]["overall"]
-    score2 = result["players"][1]["overall"]
-
-    p1["battles"] += 1
-    p2["battles"] += 1
-
-    p1["score_sum"] += score1
-    p2["score_sum"] += score2
-
-    if result["winner"] == 0:
-
-        p1["wins"] += 1
-        p2["losses"] += 1
-
-    elif result["winner"] == 1:
-
-        p2["wins"] += 1
-        p1["losses"] += 1
-
-    else:
-
-        p1["draws"] += 1
-        p2["draws"] += 1
-
-    battle = {
-        "time": datetime.now(
-            timezone.utc
-        ).isoformat(),
-
-        "player1": player1.username,
-        "player2": player2.username,
-
-        "score1": score1,
-        "score2": score2,
-
-        "winner": result["winner"],
-        "status": result["status"]
-    }
-
-    data["battles"].append(
-        battle
-    )
-
-    data["battles"] = (
-        data["battles"][-500:]
-    )
-
-    save_data(
-        data
-    )
-
-
-# ============================================================
-# TELEGRAM PROFILE
-# ============================================================
-
-async def get_profile(
-    bot: Bot,
-    user_id: int
-):
-
-    chat = await bot.get_chat(
-        user_id
-    )
-
-    username = (
-        "@"
-        +
-        chat.username
-        if chat.username
-        else "no_username"
-    )
-
-    name = (
-        chat.full_name
-        or
-        "Unknown"
-    )
-
-    bio = (
-        getattr(
-            chat,
-            "bio",
-            ""
-        )
-        or
-        ""
-    )
-
-    avatar = None
-
-    try:
-
-        photos = await bot.get_user_profile_photos(
-            user_id=user_id,
-            limit=1
-        )
-
-        if photos.total_count:
-
-            photo = photos.photos[0][-1]
-
-            telegram_file = await bot.get_file(
-                photo.file_id
-            )
-
-            buffer = io.BytesIO()
-
-            await bot.download_file(
-                telegram_file.file_path,
-                buffer
-            )
-
-            avatar = buffer.getvalue()
-
-    except Exception as error:
-
-        logger.warning(
-            "Avatar error for %s: %s",
-            user_id,
-            error
-        )
-
-    return Profile(
-        user_id=user_id,
-        username=username,
-        name=name,
-        bio=bio,
-        avatar=avatar
-    )
-
-
-# ============================================================
-# GEMINI SCHEMA
-# ============================================================
-
-GEMINI_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-
-        "players": {
-            "type": "ARRAY",
-            "minItems": 2,
-            "maxItems": 2,
-
-            "items": {
-                "type": "OBJECT",
-
-                "properties": {
-
-                    "name": {
-                        "type": "NUMBER"
-                    },
-
-                    "username": {
-                        "type": "NUMBER"
-                    },
-
-                    "bio": {
-                        "type": "NUMBER"
-                    },
-
-                    "coherence": {
-                        "type": "NUMBER"
-                    },
-
-                    "vibe": {
-                        "type": "NUMBER"
-                    }
-                },
-
-                "required": [
-                    "name",
-                    "username",
-                    "bio",
-                    "coherence",
-                    "vibe"
-                ]
-            }
-        },
-
-        "verdict": {
-            "type": "STRING"
-        }
-    },
-
-    "required": [
-        "players",
-        "verdict"
-    ]
-}
-
-
-# ============================================================
-# GEMINI PROMPT
-# ============================================================
-
-GEMINI_PROMPT = """
-Ты — AI-судья юмористической игры MOG BATTLE.
-
-Сравни два Telegram-профиля.
-
-Оценивай исключительно качество оформления профиля,
-а не личность человека.
-
-Нужно выставить РОВНО ПЯТЬ оценок:
-
-1. NAME
-2. USERNAME
-3. BIO
-4. COHERENCE
-5. VIBE
-
-Каждая оценка от 0.0 до 10.0.
-
-NAME:
-Оцени отображаемое имя:
-читаемость, стиль, запоминаемость,
-оригинальность и визуальное качество.
-
-USERNAME:
-Оцени @username:
-читаемость, запоминаемость, оригинальность,
-простоту и визуальный стиль.
-
-BIO:
-Оцени bio:
-качество текста, краткость, оригинальность,
-характер и оформление.
-
-Если bio отсутствует,
-не выдумывай текст.
-
-COHERENCE:
-Оцени сочетание:
-NAME + USERNAME + BIO + AVATAR.
-
-VIBE:
-Оцени общий стиль профиля:
-визуальное впечатление, атмосферу,
-цельность, характер и запоминаемость.
-
-Аватар используется только для COHERENCE и VIBE.
-
-Не оценивай и не делай выводы о:
-
-- расе;
-- этничности;
-- религии;
-- политических взглядах;
-- сексуальной ориентации;
-- здоровье;
-- инвалидности;
-- теле;
-- физической привлекательности;
-- точном возрасте;
-- других чувствительных характеристиках.
-
-Не выдумывай информацию.
-
-Используй весь диапазон 0-10.
-Не ставь одинаковые оценки без причины.
-
-Сделай короткий смешной русский вердикт,
-максимум 180 символов.
-
-Верни ТОЛЬКО JSON.
-"""
-
-
-# ============================================================
-# GEMINI API ERROR
-# ============================================================
-
-class GeminiAPIError(
-    RuntimeError
-):
-    pass
-
-
-# ============================================================
-# ONE GEMINI REQUEST
-# ============================================================
-
-async def gemini_request(
-    client,
-    api_key,
-    model,
-    parts
-):
-
-    model = model.strip()
-
-    if model.startswith(
-        "models/"
-    ):
-
-        model = model[
-            len("models/"):
-        ]
-
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{model}:generateContent"
-    )
-
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": parts
-            }
-        ],
-
-        "generationConfig": {
-            "responseMimeType":
-                "application/json",
-
-            "responseJsonSchema":
-                GEMINI_RESPONSE_SCHEMA,
-
-            "temperature": 0.7,
-
-            "maxOutputTokens":
-                1000
-        }
-    }
-
-    headers = {
-        "Content-Type":
-            "application/json",
-
-        "x-goog-api-key":
-            api_key
-    }
-
-    response = await client.post(
-        url,
-        headers=headers,
-        json=payload
-    )
-
-    if response.status_code != 200:
-
-        body = response.text[:2000]
-
-        raise GeminiAPIError(
-            f"Gemini API error {response.status_code}: "
-            f"{body}"
-        )
-
-    try:
-
-        data = response.json()
-
-    except Exception as error:
-
-        raise GeminiAPIError(
-            "Gemini returned invalid HTTP JSON."
-        ) from error
-
-    candidates = data.get(
-        "candidates",
-        []
-    )
-
-    if not candidates:
-
-        raise GeminiAPIError(
-            "Gemini API returned no candidates."
-        )
-
-    candidate = candidates[0]
-
-    content = candidate.get(
-        "content",
-        {}
-    )
-
-    response_parts = content.get(
-        "parts",
-        []
-    )
-
-    text_parts = []
-
-    for part in response_parts:
-
-        text_value = part.get(
-            "text"
-        )
-
-        if text_value:
-
-            text_parts.append(
-                text_value
-            )
-
-    text = "".join(
-        text_parts
-    ).strip()
-
-    if not text:
-
-        finish_reason = candidate.get(
-            "finishReason",
-            "UNKNOWN"
-        )
-
-        raise GeminiAPIError(
-            "Gemini returned empty response. "
-            f"finishReason={finish_reason}"
-        )
-
-    return text
-
-
-# ============================================================
-# PARSE GEMINI JSON
-# ============================================================
-
-def parse_gemini_json(
-    text
-):
-
-    text = str(
-        text or ""
-    ).strip()
-
-    # --------------------------------------------------------
-    # DIRECT
-    # --------------------------------------------------------
-
-    try:
-
-        return json.loads(
-            text
-        )
-
-    except json.JSONDecodeError:
-        pass
-
-    # --------------------------------------------------------
-    # CODE BLOCK
-    # --------------------------------------------------------
-
-    cleaned = re.sub(
-        r"^```(?:json)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    cleaned = re.sub(
-        r"\s*```$",
-        "",
-        cleaned
-    ).strip()
-
-    try:
-
-        return json.loads(
-            cleaned
-        )
-
-    except json.JSONDecodeError:
-        pass
-
-    # --------------------------------------------------------
-    # FIND OBJECT SAFELY
-    # --------------------------------------------------------
-
-    start = cleaned.find(
-        "{"
-    )
-
-    if start == -1:
-
-        raise RuntimeError(
-            "Gemini JSON parsing failed: no JSON object."
-        )
-
-    depth = 0
-    in_string = False
-    escape = False
-
-    for index in range(
-        start,
-        len(cleaned)
-    ):
-
-        char = cleaned[index]
-
-        if escape:
-
-            escape = False
-            continue
-
-        if char == "\\" and in_string:
-
-            escape = True
-            continue
-
-        if char == '"':
-
-            in_string = not in_string
-            continue
-
-        if in_string:
-            continue
-
-        if char == "{":
-
-            depth += 1
-
-        elif char == "}":
-
-            depth -= 1
-
-            if depth == 0:
-
-                candidate = cleaned[
-                    start:index + 1
-                ]
-
-                try:
-
-                    return json.loads(
-                        candidate
-                    )
-
-                except json.JSONDecodeError:
-                    break
-
-    logger.error(
-        "Gemini invalid JSON: %s",
-        text[:5000]
-    )
-
-    raise RuntimeError(
-        "Gemini JSON parsing failed."
-    )
-
-
-# ============================================================
-# ANALYZE WITH GEMINI
-# ============================================================
-
-async def analyze_with_gemini(
-    player1,
-    player2
-):
-
-    settings = load_settings()
-
-    api_keys = settings.get(
-        "api_keys",
-        []
-    )
-
-    model = settings.get(
-        "model",
-        DEFAULT_MODEL
-    )
-
-    if not api_keys:
-
-        raise RuntimeError(
-            "Нет Gemini API keys. "
-            "Владелец должен открыть /настройки "
-            "и добавить хотя бы один ключ."
-        )
-
-    def profile_text(
-        profile
-    ):
-
-        return (
-            f"\nUSERNAME: {profile.username}"
-            f"\nNAME: {profile.name}"
-            f"\nBIO: {profile.bio or '(нет bio)'}"
-        )
-
-    parts = [
-
-        {
-            "text":
-                GEMINI_PROMPT
-        },
-
-        {
-            "text":
-                "\n\nPLAYER 1"
-                +
-                profile_text(
-                    player1
-                )
-        },
-
-        {
-            "text":
-                "\n\nPLAYER 2"
-                +
-                profile_text(
-                    player2
-                )
-        }
-    ]
-
-    # --------------------------------------------------------
-    # AVATAR 1
-    # --------------------------------------------------------
-
-    if player1.avatar:
-
-        parts.append(
-            {
-                "inline_data": {
-                    "mime_type":
-                        "image/jpeg",
-
-                    "data":
-                        base64.b64encode(
-                            player1.avatar
-                        ).decode(
-                            "utf-8"
-                        )
-                }
-            }
-        )
-
-        parts.append(
-            {
-                "text":
-                    "Это аватар PLAYER 1."
-            }
-        )
-
-    else:
-
-        parts.append(
-            {
-                "text":
-                    "PLAYER 1 не имеет аватара."
-            }
-        )
-
-    # --------------------------------------------------------
-    # AVATAR 2
-    # --------------------------------------------------------
-
-    if player2.avatar:
-
-        parts.append(
-            {
-                "inline_data": {
-                    "mime_type":
-                        "image/jpeg",
-
-                    "data":
-                        base64.b64encode(
-                            player2.avatar
-                        ).decode(
-                            "utf-8"
-                        )
-                }
-            }
-        )
-
-        parts.append(
-            {
-                "text":
-                    "Это аватар PLAYER 2."
-            }
-        )
-
-    else:
-
-        parts.append(
-            {
-                "text":
-                    "PLAYER 2 не имеет аватара."
-            }
-        )
-
-    # --------------------------------------------------------
-    # TRY KEYS
-    # --------------------------------------------------------
-
-    last_error = None
-
-    async with GEMINI_SEMAPHORE:
-
-        async with httpx.AsyncClient(
-            timeout=GEMINI_TIMEOUT
-        ) as client:
-
-            for key_index, api_key in enumerate(
-                api_keys
-            ):
-
-                for attempt in range(
-                    GEMINI_MAX_RETRIES
-                ):
-
-                    try:
-
-                        logger.info(
-                            "Gemini request: key %s/%s, model=%s, attempt=%s",
-                            key_index + 1,
-                            len(api_keys),
-                            model,
-                            attempt + 1
-                        )
-
-                        text = await gemini_request(
-                            client,
-                            api_key,
-                            model,
-                            parts
-                        )
-
-                        result = parse_gemini_json(
-                            text
-                        )
-
-                        return result
-
-                    except GeminiAPIError as error:
-
-                        last_error = error
-
-                        error_text = str(
-                            error
-                        )
-
-                        logger.warning(
-                            "Gemini key %s failed: %s",
-                            key_index + 1,
-                            error_text[:1000]
-                        )
-
-                        # ------------------------------------------------
-                        # INVALID MODEL / INVALID KEY / PERMISSION /
-                        # QUOTA / RATE LIMIT:
-                        # сразу пробуем следующий ключ.
-                        # ------------------------------------------------
-
-                        if (
-                            "400" in error_text
-                            or
-                            "401" in error_text
-                            or
-                            "403" in error_text
-                            or
-                            "404" in error_text
-                            or
-                            "429" in error_text
-                        ):
-
-                            break
-
-                        if attempt < GEMINI_MAX_RETRIES - 1:
-
-                            await asyncio.sleep(
-                                2 ** attempt
-                            )
-
-                    except Exception as error:
-
-                        last_error = error
-
-                        logger.warning(
-                            "Gemini parsing/request error: %s",
-                            error
-                        )
-
-                        # Ошибка JSON может быть временной.
-                        if attempt < GEMINI_MAX_RETRIES - 1:
-
-                            await asyncio.sleep(
-                                2 ** attempt
-                            )
-
-                        else:
-
-                            break
-
-    if last_error:
-
-        raise RuntimeError(
-            f"Gemini API error: {last_error}"
-        )
-
-    raise RuntimeError(
-        "Gemini request failed."
-    )
-
-
-# ============================================================
-# SCORE CALCULATION
-# ============================================================
-
 def calculate_scores(
     ai_result,
-    names
+    names,
 ):
-
     raw_players = ai_result.get(
         "players",
-        []
+        [],
     )
 
-    if (
-        not isinstance(
-            raw_players,
-            list
-        )
-        or
-        len(raw_players) != 2
-    ):
-
+    if not isinstance(
+        raw_players,
+        list,
+    ) or len(raw_players) != 2:
         raise RuntimeError(
             "Gemini returned invalid players data."
         )
@@ -1297,108 +1020,77 @@ def calculate_scores(
     players = []
 
     for raw in raw_players:
-
-        if not isinstance(
-            raw,
-            dict
-        ):
-
+        if not isinstance(raw, dict):
             raise RuntimeError(
-                "Gemini returned invalid player data."
+                "Invalid player score data."
             )
 
         scores = {}
 
         for key in WEIGHTS:
-
             try:
-
                 value = float(
                     raw.get(
                         key,
-                        0
+                        0,
                     )
                 )
-
             except Exception:
-
                 value = 0.0
 
-            value = max(
+            scores[key] = max(
                 0.0,
                 min(
                     10.0,
-                    value
-                )
+                    value,
+                ),
             )
 
-            scores[key] = value
-
         overall = sum(
-            scores[key]
-            *
-            WEIGHTS[key]
-
+            scores[key] * WEIGHTS[key]
             for key in WEIGHTS
         )
 
         scores["overall"] = round(
             overall,
-            2
+            2,
         )
 
-        players.append(
-            scores
-        )
+        players.append(scores)
 
     score1 = players[0]["overall"]
     score2 = players[1]["overall"]
 
     difference = round(
-        abs(
-            score1 - score2
-        ),
-        2
+        abs(score1 - score2),
+        2,
     )
 
     if difference < 0.10:
-
         winner = None
         loser = None
         status = "DRAW"
 
     elif score1 > score2:
-
         winner = 0
         loser = 1
 
-        if difference >= 2.0:
-
+        if difference >= 2:
             status = "ABSOLUTE MOG"
-
-        elif difference >= 1.0:
-
+        elif difference >= 1:
             status = "DOMINATED"
-
         else:
-
             status = "MOGGED"
 
     else:
-
         winner = 1
         loser = 0
 
-        if difference >= 2.0:
-
+        if difference >= 2:
             status = "ABSOLUTE MOG"
-
-        elif difference >= 1.0:
-
+        elif difference >= 1:
             status = "DOMINATED"
-
         else:
-
             status = "MOGGED"
 
     winner_name = (
@@ -1408,31 +1100,18 @@ def calculate_scores(
     )
 
     return {
-        "players":
-            players,
-
-        "winner":
-            winner,
-
-        "loser":
-            loser,
-
-        "winner_name":
-            winner_name,
-
-        "difference":
-            difference,
-
-        "status":
-            status,
-
-        "verdict":
-            str(
-                ai_result.get(
-                    "verdict",
-                    "Нет вердикта."
-                )
-            )[:300]
+        "players": players,
+        "winner": winner,
+        "loser": loser,
+        "winner_name": winner_name,
+        "difference": difference,
+        "status": status,
+        "verdict": str(
+            ai_result.get(
+                "verdict",
+                "Нет вердикта.",
+            )
+        )[:300],
     }
 
 
@@ -1440,101 +1119,107 @@ def calculate_scores(
 # FONTS
 # ============================================================
 
+FONT_SIZES = {
+    "title": 58,
+    "subtitle": 22,
+    "profile_label": 23,
+    "profile_name": 42,
+    "profile_username": 27,
+    "overall_label": 22,
+    "overall_score": 36,
+    "category": 24,
+    "category_score": 24,
+    "vs": 70,
+    "stamp": 56,
+    "status": 35,
+    "winner": 34,
+    "difference_label": 23,
+    "difference_score": 31,
+    "verdict": 25,
+    "footer": 17,
+}
+
+BG = "#09090d"
+PANEL = "#111118"
+BORDER = "#24242d"
+WHITE = "#f4f4f7"
+MUTED = "#858591"
+YELLOW = "#f4c542"
+RED = "#ef3030"
+BAR_BG = "#292932"
+
 _FONT_CACHE = {}
 
 
 def get_font(
     key,
-    bold=False
+    bold=False,
 ):
-
     cache_key = (
         key,
-        bold
+        bold,
     )
 
     if cache_key in _FONT_CACHE:
+        return _FONT_CACHE[cache_key]
 
-        return _FONT_CACHE[
-            cache_key
-        ]
-
-    size = FONT_SIZES[
-        key
-    ]
+    size = FONT_SIZES[key]
 
     if bold:
-
         paths = [
             "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
         ]
-
     else:
-
         paths = [
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
         ]
 
     for path in paths:
-
         if os.path.exists(path):
-
-            font_obj = ImageFont.truetype(
+            font = ImageFont.truetype(
                 path,
-                int(size)
+                int(size),
             )
 
-            _FONT_CACHE[
-                cache_key
-            ] = font_obj
+            _FONT_CACHE[cache_key] = font
+            return font
 
-            return font_obj
+    font = ImageFont.load_default()
 
-    font_obj = ImageFont.load_default()
+    _FONT_CACHE[cache_key] = font
 
-    _FONT_CACHE[
-        cache_key
-    ] = font_obj
-
-    return font_obj
+    return font
 
 
 def f(
     key,
-    bold=False
+    bold=False,
 ):
-
     return get_font(
         key,
-        bold
+        bold,
     )
 
 
 # ============================================================
-# TEXT HELPERS
+# DRAW HELPERS
 # ============================================================
 
 def truncate_text(
     text,
-    max_chars
+    max_chars,
 ):
-
-    text = str(
-        text or ""
-    )
+    text = str(text or "")
 
     if len(text) <= max_chars:
-
         return text
 
     return (
-        text[
-            :max_chars - 1
-        ]
+        text[:max_chars - 1]
         +
         "…"
     )
@@ -1546,27 +1231,24 @@ def draw_center(
     x,
     y,
     font_obj,
-    fill
+    fill,
 ):
-
     bbox = draw.textbbox(
         (0, 0),
         text,
-        font=font_obj
+        font=font_obj,
     )
 
-    width = (
-        bbox[2] - bbox[0]
-    )
+    width = bbox[2] - bbox[0]
 
     draw.text(
         (
             x - width / 2,
-            y
+            y,
         ),
         text,
         font=font_obj,
-        fill=fill
+        fill=fill,
     )
 
 
@@ -1574,63 +1256,41 @@ def wrap_text(
     draw,
     text,
     font_obj,
-    max_width
+    max_width,
 ):
-
-    words = (
-        str(text or "")
-        .split()
-    )
+    words = str(text or "").split()
 
     if not words:
-
         return [""]
 
     lines = []
     current = ""
 
     for word in words:
-
         candidate = (
             word
             if not current
-            else
-            current
-            +
-            " "
-            +
-            word
+            else current + " " + word
         )
 
         bbox = draw.textbbox(
             (0, 0),
             candidate,
-            font=font_obj
+            font=font_obj,
         )
 
-        width = (
-            bbox[2] - bbox[0]
-        )
+        width = bbox[2] - bbox[0]
 
         if width <= max_width:
-
             current = candidate
-
         else:
-
             if current:
-
-                lines.append(
-                    current
-                )
+                lines.append(current)
 
             current = word
 
     if current:
-
-        lines.append(
-            current
-        )
+        lines.append(current)
 
     return lines
 
@@ -1641,40 +1301,24 @@ def wrap_text(
 
 def make_avatar(
     data,
-    size=260
+    size=260,
 ):
-
     result = Image.new(
         "RGBA",
-        (
-            size,
-            size
-        ),
-        (
-            0,
-            0,
-            0,
-            0
-        )
+        (size, size),
+        (0, 0, 0, 0),
     )
 
     if data:
-
         try:
-
             avatar = Image.open(
                 io.BytesIO(data)
-            ).convert(
-                "RGB"
-            )
+            ).convert("RGB")
 
-            width, height = (
-                avatar.size
-            )
-
+            width, height = avatar.size
             side = min(
                 width,
-                height
+                height,
             )
 
             left = (
@@ -1690,134 +1334,86 @@ def make_avatar(
                     left,
                     top,
                     left + side,
-                    top + side
+                    top + side,
                 )
             )
 
             avatar = avatar.resize(
-                (
-                    size,
-                    size
-                ),
-                Image.Resampling.LANCZOS
+                (size, size),
+                Image.Resampling.LANCZOS,
             )
 
         except Exception:
-
             avatar = Image.new(
                 "RGB",
-                (
-                    size,
-                    size
-                ),
-                "#26262f"
+                (size, size),
+                "#26262f",
             )
-
     else:
-
         avatar = Image.new(
             "RGB",
-            (
-                size,
-                size
-            ),
-            "#26262f"
+            (size, size),
+            "#26262f",
         )
 
     mask = Image.new(
         "L",
-        (
-            size,
-            size
-        ),
-        0
+        (size, size),
+        0,
     )
 
-    mask_draw = ImageDraw.Draw(
-        mask
-    )
+    mask_draw = ImageDraw.Draw(mask)
 
     mask_draw.ellipse(
         (
             0,
             0,
             size - 1,
-            size - 1
+            size - 1,
         ),
-        fill=255
+        fill=255,
     )
 
     result.paste(
         avatar,
-        (
-            0,
-            0
-        ),
-        mask
+        (0, 0),
+        mask,
     )
 
-    border = ImageDraw.Draw(
-        result
-    )
+    border = ImageDraw.Draw(result)
 
     border.ellipse(
         (
             3,
             3,
             size - 4,
-            size - 4
+            size - 4,
         ),
         outline=YELLOW,
-        width=6
+        width=6,
     )
 
     return result
 
 
-# ============================================================
-# CROWN
-# ============================================================
-
 def draw_crown(
     draw,
     center_x,
-    y
+    y,
 ):
-
     points = [
-        (
-            center_x - 80,
-            y + 50
-        ),
-        (
-            center_x - 65,
-            y - 15
-        ),
-        (
-            center_x - 22,
-            y + 22
-        ),
-        (
-            center_x,
-            y - 30
-        ),
-        (
-            center_x + 22,
-            y + 22
-        ),
-        (
-            center_x + 65,
-            y - 15
-        ),
-        (
-            center_x + 80,
-            y + 50
-        )
+        (center_x - 80, y + 50),
+        (center_x - 65, y - 15),
+        (center_x - 22, y + 22),
+        (center_x, y - 30),
+        (center_x + 22, y + 22),
+        (center_x + 65, y - 15),
+        (center_x + 80, y + 50),
     ]
 
     draw.polygon(
         points,
-        fill=YELLOW
+        fill=YELLOW,
     )
 
     draw.rounded_rectangle(
@@ -1825,15 +1421,15 @@ def draw_crown(
             center_x - 80,
             y + 40,
             center_x + 80,
-            y + 67
+            y + 67,
         ),
         radius=7,
-        fill=YELLOW
+        fill=YELLOW,
     )
 
 
 # ============================================================
-# PROFILE HEADER
+# CARD
 # ============================================================
 
 def draw_profile_header(
@@ -1842,15 +1438,13 @@ def draw_profile_header(
     player,
     result,
     player_index,
-    y
+    y,
 ):
-
     W = image.width
     center_x = W // 2
 
     panel_left = 70
     panel_right = W - 70
-
     panel_h = 490
 
     draw.rounded_rectangle(
@@ -1858,27 +1452,26 @@ def draw_profile_header(
             panel_left,
             y,
             panel_right,
-            y + panel_h
+            y + panel_h,
         ),
         radius=32,
         fill=PANEL,
         outline=BORDER,
-        width=3
+        width=3,
     )
 
     if result["winner"] == player_index:
-
         draw_crown(
             draw,
             center_x,
-            y + 45
+            y + 45,
         )
 
     avatar_size = 260
 
     avatar = make_avatar(
         player.avatar,
-        avatar_size
+        avatar_size,
     )
 
     avatar_x = (
@@ -1893,22 +1486,20 @@ def draw_profile_header(
         avatar,
         (
             avatar_x,
-            avatar_y
+            avatar_y,
         ),
-        avatar
+        avatar,
     )
 
-    if player_index == 0:
-
-        label = "HOST PROFILE"
-
-    else:
-
-        label = "GUEST PROFILE"
+    label = (
+        "HOST PROFILE"
+        if player_index == 0
+        else "GUEST PROFILE"
+    )
 
     label_font = f(
         "profile_label",
-        True
+        True,
     )
 
     label_box_w = 245
@@ -1939,10 +1530,10 @@ def draw_profile_header(
             label_x,
             label_y,
             label_x + label_box_w,
-            label_y + label_box_h
+            label_y + label_box_h,
         ),
         radius=24,
-        fill=label_fill
+        fill=label_fill,
     )
 
     draw_center(
@@ -1951,55 +1542,40 @@ def draw_profile_header(
         center_x,
         label_y + 8,
         label_font,
-        label_color
-    )
-
-    name = truncate_text(
-        player.name,
-        23
+        label_color,
     )
 
     draw_center(
         draw,
-        name,
+        truncate_text(
+            player.name,
+            23,
+        ),
         center_x,
         y + 395,
-        f(
-            "profile_name",
-            True
-        ),
-        WHITE
-    )
-
-    username = truncate_text(
-        player.username,
-        30
+        f("profile_name", True),
+        WHITE,
     )
 
     draw_center(
         draw,
-        username,
+        truncate_text(
+            player.username,
+            30,
+        ),
         center_x,
         y + 445,
-        f(
-            "profile_username",
-            True
-        ),
-        YELLOW
+        f("profile_username", True),
+        YELLOW,
     )
 
-
-# ============================================================
-# SCORE PANEL
-# ============================================================
 
 def draw_score_panel(
     draw,
     result,
     player_index,
-    y
+    y,
 ):
-
     W = draw._image.width
 
     panel_left = 70
@@ -2011,25 +1587,25 @@ def draw_score_panel(
             panel_left,
             y,
             panel_right,
-            y + panel_h
+            y + panel_h,
         ),
         radius=32,
         fill=PANEL,
         outline=BORDER,
-        width=3
+        width=3,
     )
 
     draw.text(
         (
             panel_left + 38,
-            y + 28
+            y + 28,
         ),
         "OVERALL SCORE",
         font=f(
             "overall_label",
-            True
+            True,
         ),
-        fill=MUTED
+        fill=MUTED,
     )
 
     overall = result[
@@ -2039,18 +1615,17 @@ def draw_score_panel(
     draw.text(
         (
             panel_left + 38,
-            y + 60
+            y + 60,
         ),
         f"{overall:.2f}",
         font=f(
             "overall_score",
-            True
+            True,
         ),
-        fill=WHITE
+        fill=WHITE,
     )
 
     if result["winner"] == player_index:
-
         badge_w = 155
         badge_h = 48
 
@@ -2069,10 +1644,10 @@ def draw_score_panel(
                 badge_x,
                 badge_y,
                 badge_x + badge_w,
-                badge_y + badge_h
+                badge_y + badge_h,
             ),
             radius=24,
-            fill="#403310"
+            fill="#403310",
         )
 
         draw_center(
@@ -2082,13 +1657,12 @@ def draw_score_panel(
             badge_y + 7,
             f(
                 "profile_label",
-                True
+                True,
             ),
-            YELLOW
+            YELLOW,
         )
 
     label_x = panel_left + 38
-
     bar_x = 300
     bar_width = 550
     score_x = 885
@@ -2098,10 +1672,8 @@ def draw_score_panel(
 
     for index, (
         label,
-        key
-    ) in enumerate(
-        CATEGORIES
-    ):
+        key,
+    ) in enumerate(CATEGORIES):
 
         row_y = (
             first_y
@@ -2116,14 +1688,14 @@ def draw_score_panel(
         draw.text(
             (
                 label_x,
-                row_y
+                row_y,
             ),
             label,
             font=f(
                 "category",
-                True
+                True,
             ),
-            fill=MUTED
+            fill=MUTED,
         )
 
         bar_y = row_y + 4
@@ -2134,10 +1706,10 @@ def draw_score_panel(
                 bar_x,
                 bar_y,
                 bar_x + bar_width,
-                bar_y + bar_h
+                bar_y + bar_h,
             ),
             radius=13,
-            fill=BAR_BG
+            fill=BAR_BG,
         )
 
         fill_w = (
@@ -2149,41 +1721,35 @@ def draw_score_panel(
         )
 
         if fill_w > 0:
-
             draw.rounded_rectangle(
                 (
                     bar_x,
                     bar_y,
                     bar_x + fill_w,
-                    bar_y + bar_h
+                    bar_y + bar_h,
                 ),
                 radius=13,
-                fill=YELLOW
+                fill=YELLOW,
             )
 
         draw.text(
             (
                 score_x,
-                row_y - 2
+                row_y - 2,
             ),
             f"{score:.2f}",
             font=f(
                 "category_score",
-                True
+                True,
             ),
-            fill=WHITE
+            fill=WHITE,
         )
 
 
-# ============================================================
-# VS
-# ============================================================
-
 def draw_vs(
     draw,
-    y
+    y,
 ):
-
     W = draw._image.width
     center_x = W // 2
 
@@ -2194,10 +1760,10 @@ def draw_vs(
             70,
             line_y,
             center_x - 115,
-            line_y
+            line_y,
         ),
         fill=BORDER,
-        width=3
+        width=3,
     )
 
     draw.line(
@@ -2205,10 +1771,10 @@ def draw_vs(
             center_x + 115,
             line_y,
             W - 70,
-            line_y
+            line_y,
         ),
         fill=BORDER,
-        width=3
+        width=3,
     )
 
     draw.rounded_rectangle(
@@ -2216,10 +1782,10 @@ def draw_vs(
             center_x - 115,
             y,
             center_x + 115,
-            y + 115
+            y + 115,
         ),
         radius=36,
-        fill=BG
+        fill=BG,
     )
 
     draw_center(
@@ -2229,50 +1795,35 @@ def draw_vs(
         y + 8,
         f(
             "vs",
-            True
+            True,
         ),
-        WHITE
+        WHITE,
     )
 
 
-# ============================================================
-# MOGGED STAMP
-# ============================================================
-
 def create_mogged_stamp():
-
     width = 520
     height = 115
 
     stamp = Image.new(
         "RGBA",
-        (
-            width,
-            height
-        ),
-        (
-            0,
-            0,
-            0,
-            0
-        )
+        (width, height),
+        (0, 0, 0, 0),
     )
 
-    draw = ImageDraw.Draw(
-        stamp
-    )
+    draw = ImageDraw.Draw(stamp)
 
     draw.rounded_rectangle(
         (
             4,
             4,
             width - 4,
-            height - 4
+            height - 4,
         ),
         radius=18,
         fill=RED,
         outline="white",
-        width=5
+        width=5,
     )
 
     draw_center(
@@ -2282,43 +1833,33 @@ def create_mogged_stamp():
         22,
         f(
             "stamp",
-            True
+            True,
         ),
-        "white"
+        "white",
     )
 
     return stamp.rotate(
         9,
         expand=True,
-        resample=Image.Resampling.BICUBIC
+        resample=Image.Resampling.BICUBIC,
     )
 
-
-# ============================================================
-# CARD
-# ============================================================
 
 def create_card(
     player1,
     player2,
-    result
+    result,
 ):
-
     W = 1100
     H = 2500
 
     image = Image.new(
         "RGB",
-        (
-            W,
-            H
-        ),
-        BG
+        (W, H),
+        BG,
     )
 
-    draw = ImageDraw.Draw(
-        image
-    )
+    draw = ImageDraw.Draw(image)
 
     center_x = W // 2
 
@@ -2329,9 +1870,9 @@ def create_card(
         30,
         f(
             "title",
-            True
+            True,
         ),
-        YELLOW
+        YELLOW,
     )
 
     draw_center(
@@ -2341,9 +1882,9 @@ def create_card(
         105,
         f(
             "subtitle",
-            True
+            True,
         ),
-        MUTED
+        MUTED,
     )
 
     draw_profile_header(
@@ -2352,19 +1893,19 @@ def create_card(
         player1,
         result,
         0,
-        150
+        150,
     )
 
     draw_score_panel(
         draw,
         result,
         0,
-        670
+        670,
     )
 
     draw_vs(
         draw,
-        1280
+        1280,
     )
 
     draw_profile_header(
@@ -2373,18 +1914,17 @@ def create_card(
         player2,
         result,
         1,
-        1415
+        1415,
     )
 
     draw_score_panel(
         draw,
         result,
         1,
-        1935
+        1935,
     )
 
     if result["loser"] is not None:
-
         stamp = create_mogged_stamp()
 
         stamp_x = (
@@ -2393,15 +1933,13 @@ def create_card(
             stamp.width // 2
         )
 
-        stamp_y = 2145
-
         image.paste(
             stamp,
             (
                 stamp_x,
-                stamp_y
+                2145,
             ),
-            stamp
+            stamp,
         )
 
     result_y = 2400
@@ -2411,36 +1949,34 @@ def create_card(
             70,
             result_y,
             W - 70,
-            result_y
+            result_y,
         ),
         fill=BORDER,
-        width=3
+        width=3,
     )
 
     draw.text(
         (
             70,
-            result_y + 20
+            result_y + 20,
         ),
         result["status"],
         font=f(
             "status",
-            True
+            True,
         ),
-        fill=RED
+        fill=RED,
     )
 
-    if result["winner"] is None:
-
-        winner_text = "DRAW"
-
-    else:
-
-        winner_text = (
+    winner_text = (
+        "DRAW"
+        if result["winner"] is None
+        else (
             "WINNER  "
             +
             result["winner_name"]
         )
+    )
 
     draw_center(
         draw,
@@ -2449,45 +1985,43 @@ def create_card(
         result_y + 65,
         f(
             "winner",
-            True
+            True,
         ),
-        YELLOW
+        YELLOW,
     )
 
     draw.text(
         (
             70,
-            result_y + 120
+            result_y + 120,
         ),
         "Разрыв",
         font=f(
             "difference_label",
-            True
+            True,
         ),
-        fill=MUTED
+        fill=MUTED,
     )
 
     draw.text(
         (
             920,
-            result_y + 116
+            result_y + 116,
         ),
         f"{result['difference']:.2f}",
         font=f(
             "difference_score",
-            True
+            True,
         ),
-        fill=YELLOW
+        fill=YELLOW,
     )
 
     verdict = truncate_text(
-        str(
-            result.get(
-                "verdict",
-                ""
-            )
+        result.get(
+            "verdict",
+            "",
         ).strip(),
-        150
+        150,
     )
 
     verdict_lines = wrap_text(
@@ -2495,19 +2029,14 @@ def create_card(
         verdict,
         f(
             "verdict",
-            True
+            True,
         ),
-        W - 130
+        W - 130,
     )
 
-    verdict_y = (
-        result_y
-        +
-        175
-    )
+    verdict_y = result_y + 175
 
     for line in verdict_lines[:2]:
-
         draw_center(
             draw,
             line,
@@ -2515,9 +2044,9 @@ def create_card(
             verdict_y,
             f(
                 "verdict",
-                True
+                True,
             ),
-            WHITE
+            WHITE,
         )
 
         verdict_y += 34
@@ -2529,9 +2058,9 @@ def create_card(
         H - 45,
         f(
             "footer",
-            True
+            True,
         ),
-        MUTED
+        MUTED,
     )
 
     output = io.BytesIO()
@@ -2539,7 +2068,7 @@ def create_card(
     image.save(
         output,
         format="PNG",
-        optimize=True
+        optimize=True,
     )
 
     return output.getvalue()
@@ -2551,9 +2080,8 @@ def create_card(
 
 def result_keyboard(
     player1_id,
-    player2_id
+    player2_id,
 ):
-
     builder = InlineKeyboardBuilder()
 
     builder.button(
@@ -2562,115 +2090,272 @@ def result_keyboard(
             f"rematch:"
             f"{player1_id}:"
             f"{player2_id}"
-        )
+        ),
     )
 
     builder.button(
         text="📊 Details",
-        callback_data="details"
+        callback_data="details",
     )
 
     builder.adjust(
         1,
-        1
+        1,
     )
 
     return builder.as_markup()
 
 
 # ============================================================
-# SETTINGS KEYBOARD
+# RESOLVE TARGET
 # ============================================================
 
-def settings_keyboard():
+async def resolve_target(
+    message: Message,
+    bot: Bot,
+):
+    # ========================================================
+    # REPLY
+    # ========================================================
 
-    builder = InlineKeyboardBuilder()
-
-    builder.button(
-        text="🔑 Добавить API key",
-        callback_data="settings:add_key"
-    )
-
-    builder.button(
-        text="📋 Список API keys",
-        callback_data="settings:list_keys"
-    )
-
-    builder.button(
-        text="🗑 Удалить API key",
-        callback_data="settings:delete_key"
-    )
-
-    builder.button(
-        text="🤖 Изменить модель",
-        callback_data="settings:model"
-    )
-
-    builder.button(
-        text="🧪 Проверить ключи",
-        callback_data="settings:test"
-    )
-
-    builder.button(
-        text="❌ Закрыть",
-        callback_data="settings:close"
-    )
-
-    builder.adjust(
-        1,
-        1,
-        1,
-        1,
-        1,
-        1
-    )
-
-    return builder.as_markup()
-
-
-# ============================================================
-# SETTINGS TEXT
-# ============================================================
-
-def settings_text():
-
-    settings = load_settings()
-
-    keys = settings.get(
-        "api_keys",
-        []
-    )
-
-    model = settings.get(
-        "model",
-        DEFAULT_MODEL
-    )
-
-    if keys:
-
-        key_text = (
-            f"🔑 API keys: <b>{len(keys)}</b>"
+    if (
+        message.reply_to_message
+        and
+        message.reply_to_message.from_user
+    ):
+        return (
+            message.from_user.id,
+            message.reply_to_message.from_user.id,
         )
 
-    else:
+    # ========================================================
+    # USERNAME
+    # ========================================================
 
-        key_text = (
-            "🔑 API keys: <b>0</b>"
+    text = message.text or ""
+
+    match = re.match(
+        r"^(\.мог|/mog)"
+        r"(?:\s+@([A-Za-z0-9_]{5,32}))?$",
+        text,
+        re.IGNORECASE,
+    )
+
+    if (
+        match
+        and
+        match.group(2)
+    ):
+        username = match.group(2)
+
+        try:
+            target = await bot.get_chat(
+                "@" + username,
+            )
+
+            return (
+                message.from_user.id,
+                target.id,
+            )
+
+        except Exception as error:
+            logger.warning(
+                "Username lookup failed: %s",
+                error,
+            )
+
+            return None
+
+    return None
+
+
+# ============================================================
+# RUN MOG
+# ============================================================
+
+async def run_mog(
+    message: Message,
+    bot: Bot,
+    player1_id: int,
+    player2_id: int,
+):
+    if player1_id == player2_id:
+        await message.answer(
+            "😐 Себя с собой сравнивать нельзя."
+        )
+        return
+
+    status_message = await message.answer(
+        "⚔️ <b>MOG BATTLE</b>\n\n"
+        "🔎 Получаю профили...\n"
+        "🖼 Загружаю аватары...\n"
+        "👤 NAME...\n"
+        "🔤 USERNAME...\n"
+        "📝 BIO...\n"
+        "🔗 COHERENCE...\n"
+        "✨ VIBE...\n"
+        "🧠 Gemini считает..."
+    )
+
+    try:
+        player1 = await get_profile(
+            bot,
+            player1_id,
         )
 
-    return (
-        "<b>⚙️ MOG AI — НАСТРОЙКИ</b>\n\n"
+        player2 = await get_profile(
+            bot,
+            player2_id,
+        )
 
-        f"{key_text}\n"
+        ai_result = await analyze_with_gemini(
+            player1,
+            player2,
+        )
 
-        f"🤖 Модель: "
-        f"<code>{html.escape(model)}</code>\n\n"
+        result = calculate_scores(
+            ai_result,
+            [
+                player1.username,
+                player2.username,
+            ],
+        )
 
-        "Здесь можно настроить Gemini "
-        "глобально для всего бота.\n\n"
+        register_battle(
+            player1,
+            player2,
+            result,
+        )
 
-        "Если один API key перестанет работать, "
-        "бот автоматически попробует следующий."
+        card = create_card(
+            player1,
+            player2,
+            result,
+        )
+
+        score1 = result[
+            "players"
+        ][0]["overall"]
+
+        score2 = result[
+            "players"
+        ][1]["overall"]
+
+        if result["winner"] is None:
+            winner_text = "🤝 <b>DRAW</b>"
+        else:
+            winner_text = (
+                "👑 <b>"
+                +
+                html.escape(
+                    result["winner_name"]
+                )
+                +
+                "</b>"
+            )
+
+        caption = (
+            "⚔️ <b>MOG BATTLE</b>\n\n"
+            f"{html.escape(player1.username)} "
+            f"<b>{score1:.2f}/10</b>\n"
+            f"{html.escape(player2.username)} "
+            f"<b>{score2:.2f}/10</b>\n\n"
+            f"{winner_text}\n"
+            f"📊 Difference: "
+            f"<b>{result['difference']:.2f}</b>\n\n"
+            f"💬 "
+            f"{html.escape(result['verdict'])}"
+        )
+
+        await message.answer_photo(
+            BufferedInputFile(
+                card,
+                filename="mog_battle.png",
+            ),
+            caption=caption,
+            reply_markup=result_keyboard(
+                player1_id,
+                player2_id,
+            ),
+        )
+
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+    except Exception as error:
+        logger.exception("MOG failed")
+
+        error_text = html.escape(
+            str(error)
+        )
+
+        if len(error_text) > 3000:
+            error_text = (
+                error_text[:3000]
+                +
+                "..."
+            )
+
+        try:
+            await status_message.edit_text(
+                "❌ <b>MOG FAILED</b>\n\n"
+                "<code>"
+                +
+                error_text
+                +
+                "</code>"
+            )
+        except Exception:
+            await message.answer(
+                "❌ <b>MOG FAILED</b>\n\n"
+                "<code>"
+                +
+                error_text
+                +
+                "</code>"
+            )
+
+
+# ============================================================
+# MOG COMMAND
+# ============================================================
+
+@dp.message(
+    F.text.regexp(
+        r"^(\.мог|/mog)"
+        r"(?:\s+@[A-Za-z0-9_]{5,32})?$",
+        flags=re.IGNORECASE,
+    )
+)
+async def mog_command(
+    message: Message,
+    bot: Bot,
+):
+    target = await resolve_target(
+        message,
+        bot,
+    )
+
+    if not target:
+        await message.answer(
+            "<b>⚔️ MOG AI</b>\n\n"
+            "Использование:\n\n"
+            "1️⃣ Ответь на сообщение:\n"
+            "<code>.мог</code>\n\n"
+            "2️⃣ Или укажи username:\n"
+            "<code>.мог @username</code>"
+        )
+        return
+
+    player1_id, player2_id = target
+
+    await run_mog(
+        message,
+        bot,
+        player1_id,
+        player2_id,
     )
 
 
@@ -2680,274 +2365,188 @@ def settings_text():
 
 @dp.message(
     F.text.regexp(
-        r"^(?:\.настройки|/настройки|/settings)$",
-        flags=re.IGNORECASE
+        r"^(\.настройки|/settings)$",
+        flags=re.IGNORECASE,
     )
 )
 async def settings_command(
-    message: Message
+    message: Message,
 ):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-
+    if not is_settings_admin(message):
         await message.answer(
             "⛔ У тебя нет доступа к настройкам."
         )
-
         return
 
-    USER_STATES.pop(
-        message.from_user.id,
-        None
-    )
+    settings = load_settings()
+
+    keys = settings["gemini_keys"]
+    model = settings["gemini_model"]
 
     await message.answer(
-        settings_text(),
-        reply_markup=settings_keyboard()
+        "⚙️ <b>MOG AI SETTINGS</b>\n\n"
+        f"🤖 Model: <code>{html.escape(model)}</code>\n"
+        f"🔑 API keys: <b>{len(keys)}</b>\n\n"
+        "Выбери действие:",
+        reply_markup=settings_keyboard(),
     )
 
 
 # ============================================================
-# SETTINGS CALLBACK
+# SETTINGS CALLBACKS
 # ============================================================
 
 @dp.callback_query(
-    F.data.startswith(
-        "settings:"
-    )
+    F.data.startswith("settings:")
 )
 async def settings_callback(
-    callback: CallbackQuery
+    callback: CallbackQuery,
 ):
-
-    if not is_owner(
-        callback.from_user.id
+    if (
+        not callback.from_user
+        or
+        callback.from_user.id != SETTINGS_ADMIN_ID
     ):
-
         await callback.answer(
             "⛔ Нет доступа.",
-            show_alert=True
+            show_alert=True,
         )
-
         return
 
     action = callback.data.split(
         ":",
-        1
+        1,
     )[1]
 
-    user_id = callback.from_user.id
+    if action == "close":
+        await callback.answer("Закрыто.")
 
-    # --------------------------------------------------------
-    # ADD KEY
-    # --------------------------------------------------------
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+
+        return
 
     if action == "add_key":
-
-        USER_STATES[user_id] = (
-            "waiting_api_key"
-        )
+        settings_waiting[
+            callback.from_user.id
+        ] = "add_key"
 
         await callback.answer()
 
         await callback.message.answer(
             "🔑 <b>Добавление API key</b>\n\n"
-
             "Отправь следующим сообщением "
-            "<b>только Gemini API key</b>.\n\n"
-
+            "ТОЛЬКО Gemini API key.\n\n"
             "Например:\n"
             "<code>AIza...</code>\n\n"
-
-            "❗ После отправки ключ будет сохранён "
-            "глобально для всего бота.\n\n"
-
-            "Для отмены отправь:\n"
-            "<code>отмена</code>"
+            "После добавления ключ будет сохранён "
+            "в запасные ключи."
         )
 
         return
 
-    # --------------------------------------------------------
-    # LIST KEYS
-    # --------------------------------------------------------
-
     if action == "list_keys":
-
         settings = load_settings()
-
-        keys = settings.get(
-            "api_keys",
-            []
-        )
+        keys = settings["gemini_keys"]
 
         if not keys:
-
             text = (
-                "📋 <b>API KEYS</b>\n\n"
+                "🔑 <b>API KEYS</b>\n\n"
                 "Ключей пока нет."
             )
-
         else:
-
             lines = []
 
             for index, key in enumerate(
-                keys,
-                1
+                keys
             ):
+                active = (
+                    " 🟢"
+                    if index == settings["active_key"]
+                    else ""
+                )
 
                 lines.append(
-                    f"{index}. "
-                    f"<code>{html.escape(mask_api_key(key))}</code>"
+                    f"{index + 1}. "
+                    f"<code>{mask_key(key)}</code>"
+                    f"{active}"
                 )
 
             text = (
-                "📋 <b>API KEYS</b>\n\n"
+                "🔑 <b>API KEYS</b>\n\n"
                 +
                 "\n".join(lines)
                 +
-                "\n\n"
-                +
-                f"🤖 Model: "
-                f"<code>{html.escape(settings.get('model', DEFAULT_MODEL))}</code>"
+                "\n\n🟢 — последний рабочий ключ"
             )
 
         await callback.answer()
 
         await callback.message.answer(
             text,
-            reply_markup=settings_keyboard()
+            reply_markup=settings_keyboard(),
         )
 
         return
 
-    # --------------------------------------------------------
-    # DELETE KEY
-    # --------------------------------------------------------
-
     if action == "delete_key":
-
         settings = load_settings()
-
-        keys = settings.get(
-            "api_keys",
-            []
-        )
+        keys = settings["gemini_keys"]
 
         if not keys:
-
             await callback.answer(
                 "Ключей нет.",
-                show_alert=True
+                show_alert=True,
             )
-
             return
 
-        builder = InlineKeyboardBuilder()
-
-        for index, key in enumerate(
-            keys
-        ):
-
-            builder.button(
-                text=(
-                    f"🗑 {index + 1}. "
-                    f"{mask_api_key(key)}"
-                ),
-                callback_data=(
-                    f"settings:delete:{index}"
-                )
-            )
-
-        builder.button(
-            text="⬅️ Назад",
-            callback_data="settings:back"
-        )
-
-        builder.adjust(
-            1
-        )
+        settings_waiting[
+            callback.from_user.id
+        ] = "delete_key"
 
         await callback.answer()
 
         await callback.message.answer(
-            "<b>🗑 Удаление API key</b>\n\n"
-            "Выбери ключ:",
-            reply_markup=builder.as_markup()
+            "🗑 <b>Удаление API key</b>\n\n"
+            "Отправь номер ключа.\n\n"
+            "Например:\n"
+            "<code>1</code>"
         )
 
         return
 
-    # --------------------------------------------------------
-    # MODEL
-    # --------------------------------------------------------
-
     if action == "model":
-
-        USER_STATES[user_id] = (
-            "waiting_model"
-        )
-
-        settings = load_settings()
-
-        current_model = settings.get(
-            "model",
-            DEFAULT_MODEL
-        )
+        settings_waiting[
+            callback.from_user.id
+        ] = "model"
 
         await callback.answer()
 
         await callback.message.answer(
             "🤖 <b>Изменение модели</b>\n\n"
-
-            "Текущая модель:\n"
-            f"<code>{html.escape(current_model)}</code>\n\n"
-
-            "Отправь название новой модели.\n\n"
-
-            "Например:\n"
+            "Отправь название модели, например:\n"
             "<code>gemini-2.5-flash</code>\n\n"
-
-            "Также можно отправить:\n"
-            "<code>gemini-3.6-flash</code>\n\n"
-
-            "Для отмены:\n"
-            "<code>отмена</code>"
+            "Можно также использовать другую "
+            "модель, доступную твоим API keys."
         )
 
         return
 
-    # --------------------------------------------------------
-    # TEST
-    # --------------------------------------------------------
-
-    if action == "test":
-
+    if action == "test_keys":
         await callback.answer(
-            "🧪 Проверяю ключи..."
+            "🔄 Проверяю ключи...",
         )
 
         settings = load_settings()
-
-        keys = settings.get(
-            "api_keys",
-            []
-        )
-
-        model = settings.get(
-            "model",
-            DEFAULT_MODEL
-        )
+        keys = settings["gemini_keys"]
+        model = settings["gemini_model"]
 
         if not keys:
-
             await callback.message.answer(
                 "❌ Нет API keys."
             )
-
             return
 
         results = []
@@ -2956,429 +2555,600 @@ async def settings_callback(
             timeout=30
         ) as client:
 
-            for index, key in enumerate(
-                keys,
-                1
-            ):
+            for index, key in enumerate(keys):
+                url = (
+                    "https://generativelanguage.googleapis.com/"
+                    f"v1beta/models/{model}"
+                )
 
                 try:
-
-                    url = (
-                        "https://generativelanguage.googleapis.com/"
-                        f"v1beta/models/{model}:generateContent"
-                    )
-
-                    payload = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {
-                                        "text":
-                                            "Reply only with OK."
-                                    }
-                                ]
-                            }
-                        ],
-
-                        "generationConfig": {
-                            "maxOutputTokens": 10
-                        }
-                    }
-
-                    response = await client.post(
+                    response = await client.get(
                         url,
                         headers={
-                            "Content-Type":
-                                "application/json",
-
-                            "x-goog-api-key":
-                                key
+                            "x-goog-api-key": key,
                         },
-                        json=payload
                     )
 
                     if response.status_code == 200:
-
                         results.append(
-                            f"✅ Key {index}: работает"
+                            f"🟢 <b>#{index + 1}</b> "
+                            f"{mask_key(key)} — OK"
                         )
-
                     else:
-
                         results.append(
-                            f"❌ Key {index}: "
+                            f"🔴 <b>#{index + 1}</b> "
+                            f"{mask_key(key)} — "
                             f"HTTP {response.status_code}"
                         )
 
                 except Exception as error:
-
                     results.append(
-                        f"❌ Key {index}: "
-                        f"{str(error)[:100]}"
+                        f"🔴 <b>#{index + 1}</b> "
+                        f"{mask_key(key)} — "
+                        f"{html.escape(str(error)[:100])}"
                     )
 
         await callback.message.answer(
-            "<b>🧪 ПРОВЕРКА GEMINI</b>\n\n"
+            "🔍 <b>Результат проверки</b>\n\n"
             +
-            "\n".join(results)
-            +
-            "\n\n"
-            f"🤖 Model: "
-            f"<code>{html.escape(model)}</code>"
+            "\n".join(results),
+            reply_markup=settings_keyboard(),
         )
-
-        return
-
-    # --------------------------------------------------------
-    # DELETE ONE KEY
-    # --------------------------------------------------------
-
-    if action.startswith(
-        "delete"
-    ):
-
-        parts = action.split(
-            ":"
-        )
-
-        if len(parts) != 2:
-
-            await callback.answer(
-                "Ошибка.",
-                show_alert=True
-            )
-
-            return
-
-        try:
-
-            index = int(
-                parts[1]
-            )
-
-        except ValueError:
-
-            await callback.answer(
-                "Ошибка.",
-                show_alert=True
-            )
-
-            return
-
-        settings = load_settings()
-
-        keys = settings.get(
-            "api_keys",
-            []
-        )
-
-        if (
-            index < 0
-            or
-            index >= len(keys)
-        ):
-
-            await callback.answer(
-                "Ключ уже отсутствует.",
-                show_alert=True
-            )
-
-            return
-
-        deleted = keys.pop(
-            index
-        )
-
-        settings["api_keys"] = keys
-
-        save_settings(
-            settings
-        )
-
-        USER_STATES.pop(
-            user_id,
-            None
-        )
-
-        await callback.answer(
-            "Ключ удалён."
-        )
-
-        await callback.message.answer(
-            "🗑 API key удалён:\n"
-            f"<code>{html.escape(mask_api_key(deleted))}</code>\n\n"
-            +
-            settings_text(),
-            reply_markup=settings_keyboard()
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # BACK
-    # --------------------------------------------------------
-
-    if action == "back":
-
-        USER_STATES.pop(
-            user_id,
-            None
-        )
-
-        await callback.answer()
-
-        await callback.message.answer(
-            settings_text(),
-            reply_markup=settings_keyboard()
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # CLOSE
-    # --------------------------------------------------------
-
-    if action == "close":
-
-        USER_STATES.pop(
-            user_id,
-            None
-        )
-
-        await callback.answer(
-            "Настройки закрыты."
-        )
-
-        try:
-
-            await callback.message.delete()
-
-        except Exception:
-
-            pass
 
         return
 
 
 # ============================================================
-# SETTINGS INPUT HANDLER
-#
-# КЛЮЧЕВОЙ FIX
+# SETTINGS INPUT
 # ============================================================
 
-@dp.message(
-    F.text
-)
+@dp.message()
 async def settings_input_handler(
-    message: Message
+    message: Message,
 ):
+    if not is_settings_admin(message):
+        return
 
     user_id = message.from_user.id
 
-    # --------------------------------------------------------
-    # Только OWNER
-    # --------------------------------------------------------
-
-    if not is_owner(
-        user_id
-    ):
-
-        return
-
-    state = USER_STATES.get(
+    action = settings_waiting.get(
         user_id
     )
 
-    # --------------------------------------------------------
-    # Ничего не ждём
-    # --------------------------------------------------------
-
-    if not state:
-
+    if not action:
         return
 
     text = (
-        message.text
-        or
-        ""
+        message.text or ""
     ).strip()
 
-    # --------------------------------------------------------
-    # CANCEL
-    # --------------------------------------------------------
+    if not text:
+        await message.answer(
+            "❌ Нужно отправить текст."
+        )
+        return
 
-    if text.lower() in (
-        "отмена",
-        "cancel",
-        "/cancel"
-    ):
+    # ========================================================
+    # ADD KEY
+    # ========================================================
 
-        USER_STATES.pop(
+    if action == "add_key":
+
+        # Убираем случайные пробелы
+        key = text.strip()
+
+        # Gemini keys обычно начинаются с AIza,
+        # но не будем жёстко ограничивать формат.
+        if len(key) < 20:
+            await message.answer(
+                "❌ Похоже, это слишком короткий API key.\n"
+                "Отправь настоящий Gemini API key."
+            )
+            return
+
+        async with settings_lock:
+            settings = load_settings()
+
+            if key in settings["gemini_keys"]:
+                settings_waiting.pop(
+                    user_id,
+                    None,
+                )
+
+                await message.answer(
+                    "⚠️ Этот API key уже добавлен.",
+                    reply_markup=settings_keyboard(),
+                )
+
+                return
+
+            settings["gemini_keys"].append(key)
+
+            # Если это первый ключ
+            if len(settings["gemini_keys"]) == 1:
+                settings["active_key"] = 0
+
+            save_settings(settings)
+
+        settings_waiting.pop(
             user_id,
-            None
+            None,
         )
 
         await message.answer(
-            "❌ Действие отменено.\n\n"
-            +
-            settings_text(),
-            reply_markup=settings_keyboard()
+            "✅ <b>API key добавлен.</b>\n\n"
+            f"🔑 Ключ: "
+            f"<code>{mask_key(key)}</code>\n"
+            f"📦 Всего ключей: "
+            f"<b>{len(settings['gemini_keys'])}</b>\n\n"
+            "Если текущий ключ перестанет работать, "
+            "бот автоматически попробует следующий.",
+            reply_markup=settings_keyboard(),
         )
 
         return
 
     # ========================================================
-    # WAITING API KEY
+    # DELETE KEY
     # ========================================================
 
-    if state == "waiting_api_key":
+    if action == "delete_key":
 
-        # Telegram API key обычно начинается с AIza,
-        # но не будем жёстко требовать конкретный формат,
-        # чтобы не ломать новые форматы ключей.
-
-        if (
-            len(text) < 20
-            or
-            len(text) > 500
-            or
-            any(
-                char.isspace()
-                for char in text
-            )
-        ):
-
+        try:
+            index = int(text) - 1
+        except ValueError:
             await message.answer(
-                "❌ Похоже, это не API key.\n\n"
-                "Отправь ключ одним сообщением "
-                "без пробелов.\n\n"
-                "Для отмены: <code>отмена</code>"
+                "❌ Отправь номер ключа, например <code>1</code>."
             )
-
             return
 
-        settings = load_settings()
+        async with settings_lock:
+            settings = load_settings()
+            keys = settings["gemini_keys"]
 
-        keys = settings.get(
-            "api_keys",
-            []
-        )
+            if (
+                index < 0
+                or
+                index >= len(keys)
+            ):
+                await message.answer(
+                    "❌ Такого ключа нет."
+                )
+                return
 
-        if text in keys:
+            deleted = keys.pop(index)
 
-            USER_STATES.pop(
-                user_id,
-                None
-            )
+            if keys:
+                settings["active_key"] %= len(keys)
+            else:
+                settings["active_key"] = 0
 
-            await message.answer(
-                "⚠️ Этот API key уже есть в списке.\n\n"
-                +
-                settings_text(),
-                reply_markup=settings_keyboard()
-            )
+            save_settings(settings)
 
-            return
-
-        keys.append(
-            text
-        )
-
-        settings["api_keys"] = keys
-
-        save_settings(
-            settings
-        )
-
-        USER_STATES.pop(
+        settings_waiting.pop(
             user_id,
-            None
+            None,
         )
 
         await message.answer(
-            "✅ <b>API key добавлен!</b>\n\n"
-
-            f"🔑 Key: "
-            f"<code>{html.escape(mask_api_key(text))}</code>\n"
-
-            f"📊 Всего ключей: "
-            f"<b>{len(keys)}</b>\n\n"
-
-            "Если этот ключ перестанет работать, "
-            "бот автоматически перейдёт к следующему.\n\n"
-
-            +
-            settings_text(),
-            reply_markup=settings_keyboard()
+            "🗑 <b>API key удалён.</b>\n\n"
+            f"<code>{mask_key(deleted)}</code>\n\n"
+            f"Осталось ключей: "
+            f"<b>{len(keys)}</b>",
+            reply_markup=settings_keyboard(),
         )
 
         return
 
     # ========================================================
-    # WAITING MODEL
+    # MODEL
     # ========================================================
 
-    if state == "waiting_model":
+    if action == "model":
 
         model = text
 
-        model = model.replace(
-            "models/",
-            ""
-        ).strip()
-
-        if (
-            len(model) < 3
-            or
-            len(model) > 150
-            or
-            " " in model
-        ):
-
+        # Небольшая защита от мусора
+        if len(model) > 100:
             await message.answer(
-                "❌ Некорректное название модели.\n\n"
-                "Например:\n"
-                "<code>gemini-2.5-flash</code>"
+                "❌ Слишком длинное название модели."
             )
-
             return
 
-        settings = load_settings()
+        async with settings_lock:
+            settings = load_settings()
+            settings["gemini_model"] = model
+            save_settings(settings)
 
-        settings["model"] = model
-
-        save_settings(
-            settings
-        )
-
-        USER_STATES.pop(
+        settings_waiting.pop(
             user_id,
-            None
+            None,
         )
 
         await message.answer(
-            "✅ <b>Модель изменена!</b>\n\n"
-
-            f"🤖 Теперь используется:\n"
-            f"<code>{html.escape(model)}</code>\n\n"
-
-            "Глобально для всего бота.",
-            reply_markup=settings_keyboard()
+            "✅ <b>Модель изменена.</b>\n\n"
+            f"🤖 <code>{html.escape(model)}</code>\n\n"
+            "Теперь MOG будет использовать её.",
+            reply_markup=settings_keyboard(),
         )
 
         return
 
 
 # ============================================================
-# RESOLVE TARGET
+# START
 # ============================================================
 
-async def resolve_target(
+@dp.message(
+    Command("start")
+)
+async def start_command(
     message: Message,
-    bot: Bot
 ):
+    await message.answer(
+        "<b>⚔️ MOG AI</b>\n\n"
+        "AI-баттлы Telegram-профилей.\n\n"
+        "🥊 Ответь на сообщение человека:\n"
+        "<code>.мог</code>\n\n"
+        "Или:\n"
+        "<code>.мог @username</code>\n\n"
+        "Gemini оценивает:\n"
+        "👤 NAME\n"
+        "🔤 USERNAME\n"
+        "📝 BIO\n"
+        "🔗 COHERENCE\n"
+        "✨ VIBE\n\n"
+        "🏆 Побеждает тот, у кого выше Overall."
+    )
 
-    if (
-        message.reply_to_message
-        and
-        message.reply_to
+
+# ============================================================
+# HELP
+# ============================================================
+
+@dp.message(
+    Command("help")
+)
+async def help_command(
+    message: Message,
+):
+    await message.answer(
+        "<b>⚔️ MOG AI — COMMANDS</b>\n\n"
+        "<code>.мог</code>\n"
+        "Сравнить себя с человеком, "
+        "на сообщение которого ты ответил.\n\n"
+        "<code>.мог @username</code>\n"
+        "Сравнить себя с username.\n\n"
+        "<code>/mog</code>\n"
+        "То же самое.\n\n"
+        "<code>.настройки</code>\n"
+        "Настройки Gemini для администратора.\n\n"
+        "<code>/stats</code>\n"
+        "Твоя статистика.\n\n"
+        "<code>/top</code>\n"
+        "Топ игроков.\n\n"
+        "<code>/history</code>\n"
+        "Последние баттлы.\n\n"
+        "<code>/help</code>\n"
+        "Помощь."
+    )
+
+
+# ============================================================
+# STATS
+# ============================================================
+
+@dp.message(
+    Command("stats")
+)
+async def stats_command(
+    message: Message,
+):
+    data = load_data()
+
+    user_id = str(
+        message.from_user.id
+    )
+
+    user = data["users"].get(
+        user_id
+    )
+
+    if not user:
+        await message.answer(
+            "📊 У тебя пока нет MOG-баттлов."
+        )
+        return
+
+    battles = user["battles"]
+    wins = user["wins"]
+    losses = user["losses"]
+    draws = user["draws"]
+
+    if battles:
+        winrate = (
+            wins
+            /
+            battles
+            *
+            100
+        )
+
+        average = (
+            user["score_sum"]
+            /
+            battles
+        )
+    else:
+        winrate = 0
+        average = 0
+
+    await message.answer(
+        "<b>📊 YOUR MOG STATS</b>\n\n"
+        f"⚔️ Battles: <b>{battles}</b>\n"
+        f"🏆 Wins: <b>{wins}</b>\n"
+        f"💀 Losses: <b>{losses}</b>\n"
+        f"🤝 Draws: <b>{draws}</b>\n\n"
+        f"📈 Winrate: <b>{winrate:.1f}%</b>\n"
+        f"⭐ Average score: <b>{average:.2f}/10</b>"
+    )
+
+
+# ============================================================
+# TOP
+# ============================================================
+
+@dp.message(
+    Command("top")
+)
+async def top_command(
+    message: Message,
+):
+    data = load_data()
+
+    users = []
+
+    for user in data["users"].values():
+        if user["battles"] <= 0:
+            continue
+
+        average = (
+            user["score_sum"]
+            /
+            user["battles"]
+        )
+
+        users.append(
+            {
+                "username": user["username"],
+                "wins": user["wins"],
+                "battles": user["battles"],
+                "average": average,
+            }
+        )
+
+    users.sort(
+        key=lambda x: (
+            x["wins"],
+            x["average"],
+        ),
+        reverse=True,
+    )
+
+    users = users[:10]
+
+    if not users:
+        await message.answer(
+            "🏆 Пока нет статистики."
+        )
+        return
+
+    medals = [
+        "🥇",
+        "🥈",
+        "🥉",
+    ]
+
+    text = "<b>🏆 MOG TOP 10</b>\n\n"
+
+    for index, user in enumerate(users):
+        if index < 3:
+            position = medals[index]
+        else:
+            position = f"<b>{index + 1}.</b>"
+
+        username = html.escape(
+            str(user["username"])
+        )
+
+        text += (
+            f"{position} "
+            f"{username} — "
+            f"<b>{user['wins']}</b> wins "
+            f"• {user['average']:.2f}/10\n"
+        )
+
+    await message.answer(text)
+
+
+# ============================================================
+# HISTORY
+# ============================================================
+
+@dp.message(
+    Command("history")
+)
+async def history_command(
+    message: Message,
+):
+    data = load_data()
+
+    battles = data["battles"][-10:]
+
+    if not battles:
+        await message.answer(
+            "📜 История пока пустая."
+        )
+        return
+
+    battles.reverse()
+
+    text = "<b>📜 LAST MOG BATTLES</b>\n\n"
+
+    for battle in battles:
+
+        if battle["winner"] == 0:
+            winner = battle["player1"]
+        elif battle["winner"] == 1:
+            winner = battle["player2"]
+        else:
+            winner = "DRAW"
+
+        p1 = html.escape(
+            str(battle["player1"])
+        )
+
+        p2 = html.escape(
+            str(battle["player2"])
+        )
+
+        winner = html.escape(
+            str(winner)
+        )
+
+        text += (
+            f"⚔️ {p1} "
+            f"<b>{battle['score1']:.2f}</b>"
+            f" × "
+            f"<b>{battle['score2']:.2f}</b> "
+            f"{p2}\n"
+            f"🏆 {winner}\n\n"
+        )
+
+    await message.answer(text)
+
+
+# ============================================================
+# REMATCH
+# ============================================================
+
+@dp.callback_query(
+    F.data.startswith("rematch:")
+)
+async def rematch_callback(
+    callback: CallbackQuery,
+    bot: Bot,
+):
+    try:
+        parts = callback.data.split(":")
+
+        if len(parts) != 3:
+            raise ValueError(
+                "Invalid callback data"
+            )
+
+        player1_id = int(parts[1])
+        player2_id = int(parts[2])
+
+        await callback.answer(
+            "🔄 Новый MOG!"
+        )
+
+        await run_mog(
+            callback.message,
+            bot,
+            player1_id,
+            player2_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Rematch failed"
+        )
+
+        await callback.answer(
+            "❌ Ошибка",
+            show_alert=True,
+        )
+
+
+# ============================================================
+# DETAILS
+# ============================================================
+
+@dp.callback_query(
+    F.data == "details"
+)
+async def details_callback(
+    callback: CallbackQuery,
+):
+    await callback.answer(
+        "Карточка содержит все пять оценок.",
+        show_alert=True,
+    )
+
+
+# ============================================================
+# UNKNOWN COMMAND HANDLER
+# ============================================================
+
+@dp.message(
+    F.text.startswith("/")
+)
+async def unknown_command(
+    message: Message,
+):
+    await message.answer(
+        "❓ Неизвестная команда.\n\n"
+        "Напиши <code>/help</code>."
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    logger.info(
+        "Starting MOG AI bot..."
+    )
+
+    settings = load_settings()
+
+    logger.info(
+        "Gemini model: %s",
+        settings["gemini_model"],
+    )
+
+    logger.info(
+        "Gemini keys configured: %s",
+        len(settings["gemini_keys"]),
+    )
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+
+    try:
+        me = await bot.get_me()
+
+        logger.info(
+            "Logged in as @%s",
+            me.username,
+        )
+
+        await dp.start_polling(bot)
+
+    finally:
+        await bot.session.close()
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    asyncio.run(main())
