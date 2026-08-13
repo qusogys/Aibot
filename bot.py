@@ -40,7 +40,6 @@ DATA_FILE = "mog_data.json"
 GEMINI_MAX_RETRIES = 4
 GEMINI_TIMEOUT = 120
 
-# Не даём нескольким MOG одновременно забивать API.
 GEMINI_SEMAPHORE = asyncio.Semaphore(2)
 
 
@@ -69,14 +68,6 @@ dp = Dispatcher()
 # SCORING
 # ============================================================
 
-# РОВНО 5 КАТЕГОРИЙ
-#
-# NAME       20%
-# USERNAME   20%
-# BIO        20%
-# COHERENCE  20%
-# VIBE       20%
-
 WEIGHTS = {
     "name": 0.20,
     "username": 0.20,
@@ -96,9 +87,6 @@ CATEGORIES = [
 
 # ============================================================
 # CARD FONT SETTINGS
-#
-# ВСЕ РАЗМЕРЫ ТЕКСТА МЕНЯЮТСЯ ЗДЕСЬ.
-# Больше нигде шрифты вручную искать не нужно.
 # ============================================================
 
 FONT_SIZES = {
@@ -501,6 +489,133 @@ GEMINI_RESPONSE_SCHEMA = {
 
 
 # ============================================================
+# GEMINI JSON PARSER
+# ============================================================
+
+def parse_gemini_json(text: str):
+
+    if not text:
+
+        raise ValueError(
+            "Gemini returned empty response."
+        )
+
+    original = text
+
+    text = text.strip()
+
+    # --------------------------------------------------------
+    # REMOVE MARKDOWN JSON FENCES
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^```(?:json)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
+
+    text = text.strip()
+
+    # --------------------------------------------------------
+    # FIRST ATTEMPT: PURE JSON
+    # --------------------------------------------------------
+
+    try:
+
+        result = json.loads(
+            text
+        )
+
+        if isinstance(
+            result,
+            dict
+        ):
+
+            return result
+
+    except json.JSONDecodeError:
+        pass
+
+    # --------------------------------------------------------
+    # SECOND ATTEMPT:
+    # FIND JSON OBJECT INSIDE TEXT
+    # --------------------------------------------------------
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if (
+        start == -1
+        or
+        end == -1
+        or
+        end <= start
+    ):
+
+        logger.error(
+            "Gemini response does not contain JSON object."
+        )
+
+        logger.error(
+            "Gemini RAW RESPONSE: %r",
+            original[:10000]
+        )
+
+        raise RuntimeError(
+            "Gemini JSON parsing failed: no JSON object."
+        )
+
+    candidate = text[
+        start:end + 1
+    ]
+
+    try:
+
+        result = json.loads(
+            candidate
+        )
+
+    except json.JSONDecodeError as error:
+
+        logger.error(
+            "Gemini JSON parsing failed: %s",
+            error
+        )
+
+        logger.error(
+            "Gemini RAW RESPONSE: %r",
+            original[:10000]
+        )
+
+        logger.error(
+            "Gemini CLEANED RESPONSE: %r",
+            candidate[:10000]
+        )
+
+        raise RuntimeError(
+            "Gemini JSON parsing failed."
+        ) from error
+
+    if not isinstance(
+        result,
+        dict
+    ):
+
+        raise RuntimeError(
+            "Gemini JSON is not an object."
+        )
+
+    return result
+
+
+# ============================================================
 # GEMINI
 # ============================================================
 
@@ -682,13 +797,17 @@ VIBE:
         )
 
     # ========================================================
-    # URL
+    # GEMINI URL
     # ========================================================
 
     url = (
         "https://generativelanguage.googleapis.com/"
         f"v1beta/models/{GEMINI_MODEL}:generateContent"
     )
+
+    # ========================================================
+    # PAYLOAD
+    # ========================================================
 
     payload = {
         "contents": [
@@ -698,11 +817,15 @@ VIBE:
         ],
 
         "generationConfig": {
+
             "responseMimeType":
                 "application/json",
 
             "responseJsonSchema":
                 GEMINI_RESPONSE_SCHEMA,
+
+            "temperature":
+                0,
 
             "maxOutputTokens":
                 1000
@@ -716,6 +839,10 @@ VIBE:
         "x-goog-api-key":
             GEMINI_API_KEY
     }
+
+    # ========================================================
+    # REQUEST
+    # ========================================================
 
     async with GEMINI_SEMAPHORE:
 
@@ -772,17 +899,17 @@ VIBE:
 
                     continue
 
-                # ============================================
+                # ====================================================
                 # SUCCESS
-                # ============================================
+                # ====================================================
 
                 if response.status_code == 200:
 
                     break
 
-                # ============================================
+                # ====================================================
                 # RATE LIMIT
-                # ============================================
+                # ====================================================
 
                 if response.status_code == 429:
 
@@ -845,9 +972,9 @@ VIBE:
 
                     continue
 
-                # ============================================
+                # ====================================================
                 # SERVER ERRORS
-                # ============================================
+                # ====================================================
 
                 if response.status_code in (
                     500,
@@ -861,6 +988,12 @@ VIBE:
                         >=
                         GEMINI_MAX_RETRIES - 1
                     ):
+
+                        logger.error(
+                            "Gemini server error %s: %s",
+                            response.status_code,
+                            response.text[:3000]
+                        )
 
                         response.raise_for_status()
 
@@ -885,14 +1018,14 @@ VIBE:
 
                     continue
 
-                # ============================================
-                # OTHER ERROR
-                # ============================================
+                # ====================================================
+                # OTHER HTTP ERROR
+                # ====================================================
 
                 logger.error(
                     "Gemini HTTP %s: %s",
                     response.status_code,
-                    response.text[:2000]
+                    response.text[:5000]
                 )
 
                 response.raise_for_status()
@@ -914,13 +1047,45 @@ VIBE:
     except Exception as error:
 
         logger.error(
-            "Gemini returned non-JSON HTTP body: %s",
-            response.text[:3000]
+            "Gemini returned non-JSON HTTP body:"
+        )
+
+        logger.error(
+            "%s",
+            response.text[:5000]
         )
 
         raise RuntimeError(
             "Gemini returned invalid HTTP JSON."
         ) from error
+
+    # ========================================================
+    # CHECK GEMINI API ERROR
+    # ========================================================
+
+    if "error" in data:
+
+        logger.error(
+            "Gemini API error: %s",
+            json.dumps(
+                data,
+                ensure_ascii=False
+            )[:5000]
+        )
+
+        error_message = (
+            data.get(
+                "error",
+                {}
+            ).get(
+                "message",
+                "Unknown Gemini API error."
+            )
+        )
+
+        raise RuntimeError(
+            f"Gemini API error: {error_message}"
+        )
 
     # ========================================================
     # GET MODEL TEXT
@@ -935,11 +1100,21 @@ VIBE:
 
         if not candidates:
 
+            logger.error(
+                "Gemini response without candidates: %s",
+                json.dumps(
+                    data,
+                    ensure_ascii=False
+                )[:5000]
+            )
+
             raise RuntimeError(
                 "Gemini returned no candidates."
             )
 
-        content = candidates[0].get(
+        candidate = candidates[0]
+
+        content = candidate.get(
             "content",
             {}
         )
@@ -953,99 +1128,104 @@ VIBE:
 
         for part in response_parts:
 
-            if "text" in part:
+            if (
+                isinstance(part, dict)
+                and
+                "text" in part
+            ):
 
                 text_parts.append(
-                    part["text"]
+                    str(
+                        part["text"]
+                    )
                 )
 
         text = "".join(
             text_parts
         ).strip()
 
-    except Exception:
+        # ----------------------------------------------------
+        # FINISH REASON
+        # ----------------------------------------------------
+
+        finish_reason = candidate.get(
+            "finishReason"
+        )
+
+        if finish_reason:
+
+            logger.info(
+                "Gemini finish reason: %s",
+                finish_reason
+            )
+
+    except RuntimeError:
+
+        raise
+
+    except Exception as error:
 
         logger.error(
-            "Gemini response: %s",
+            "Gemini response parsing error: %s",
+            error
+        )
+
+        logger.error(
+            "Gemini full response: %s",
             json.dumps(
                 data,
                 ensure_ascii=False
-            )[:5000]
+            )[:10000]
         )
 
         raise RuntimeError(
             "Gemini returned an invalid response."
-        )
+        ) from error
 
     if not text:
+
+        logger.error(
+            "Gemini returned empty text."
+        )
+
+        logger.error(
+            "Gemini full response: %s",
+            json.dumps(
+                data,
+                ensure_ascii=False
+            )[:10000]
+        )
 
         raise RuntimeError(
             "Gemini returned an empty response."
         )
 
     # ========================================================
-    # DIRECT JSON PARSE
+    # LOG RAW RESPONSE
     # ========================================================
-    #
-    # Никакого:
-    # re.search(r"\{.*\}")
-    #
-    # Structured output должен вернуть чистый JSON.
-    #
+
+    logger.info(
+        "Gemini raw text: %r",
+        text[:10000]
+    )
+
+    # ========================================================
+    # PARSE JSON
+    # ========================================================
 
     try:
 
-        result = json.loads(
+        result = parse_gemini_json(
             text
         )
 
-    except json.JSONDecodeError:
+    except Exception:
 
-        logger.error(
-            "Gemini text was not valid JSON:"
+        logger.exception(
+            "Gemini JSON parsing failed."
         )
 
-        logger.error(
-            "%s",
-            text
-        )
-
-        # ====================================================
-        # EMERGENCY FALLBACK
-        # ====================================================
-
-        cleaned = text.strip()
-
-        cleaned = re.sub(
-            r"^```json\s*",
-            "",
-            cleaned,
-            flags=re.IGNORECASE
-        )
-
-        cleaned = re.sub(
-            r"^```\s*",
-            "",
-            cleaned
-        )
-
-        cleaned = re.sub(
-            r"\s*```$",
-            "",
-            cleaned
-        )
-
-        try:
-
-            result = json.loads(
-                cleaned
-            )
-
-        except json.JSONDecodeError as error:
-
-            raise RuntimeError(
-                "Gemini JSON parsing failed."
-            ) from error
+        raise
 
     # ========================================================
     # VALIDATE TOP LEVEL
@@ -1073,6 +1253,11 @@ VIBE:
         len(players) != 2
     ):
 
+        logger.error(
+            "Invalid Gemini players: %r",
+            players
+        )
+
         raise RuntimeError(
             "Gemini returned invalid players data."
         )
@@ -1081,7 +1266,9 @@ VIBE:
     # SANITIZE SCORES
     # ========================================================
 
-    for player in players:
+    for player_index, player in enumerate(
+        players
+    ):
 
         if not isinstance(
             player,
@@ -1105,6 +1292,18 @@ VIBE:
 
             except Exception:
 
+                logger.warning(
+                    "Invalid score from Gemini: player=%s key=%s value=%r",
+                    player_index,
+                    key,
+                    player.get(key)
+                )
+
+                value = 0.0
+
+            if not (
+                value == value
+            ):
                 value = 0.0
 
             player[key] = max(
@@ -1115,12 +1314,20 @@ VIBE:
                 )
             )
 
+    # ========================================================
+    # VERDICT
+    # ========================================================
+
     result["verdict"] = str(
         result.get(
             "verdict",
             "Нет вердикта."
         )
     )[:300]
+
+    logger.info(
+        "Gemini analysis successful."
+    )
 
     return result
 
@@ -1686,10 +1893,6 @@ def draw_profile_header(
 
     panel_h = 490
 
-    # ========================================================
-    # PANEL
-    # ========================================================
-
     draw.rounded_rectangle(
         (
             panel_left,
@@ -1703,10 +1906,6 @@ def draw_profile_header(
         width=3
     )
 
-    # ========================================================
-    # CROWN
-    # ========================================================
-
     if result["winner"] == player_index:
 
         draw_crown(
@@ -1714,10 +1913,6 @@ def draw_profile_header(
             center_x,
             y + 45
         )
-
-    # ========================================================
-    # AVATAR
-    # ========================================================
 
     avatar_size = 260
 
@@ -1742,10 +1937,6 @@ def draw_profile_header(
         ),
         avatar
     )
-
-    # ========================================================
-    # LABEL
-    # ========================================================
 
     if player_index == 0:
 
@@ -1803,10 +1994,6 @@ def draw_profile_header(
         label_color
     )
 
-    # ========================================================
-    # NAME
-    # ========================================================
-
     name = truncate_text(
         player.name,
         23
@@ -1823,10 +2010,6 @@ def draw_profile_header(
         ),
         WHITE
     )
-
-    # ========================================================
-    # USERNAME
-    # ========================================================
 
     username = truncate_text(
         player.username,
@@ -1863,10 +2046,6 @@ def draw_score_panel(
     panel_right = W - 70
     panel_h = 585
 
-    # ========================================================
-    # PANEL
-    # ========================================================
-
     draw.rounded_rectangle(
         (
             panel_left,
@@ -1879,10 +2058,6 @@ def draw_score_panel(
         outline=BORDER,
         width=3
     )
-
-    # ========================================================
-    # OVERALL
-    # ========================================================
 
     draw.text(
         (
@@ -1913,10 +2088,6 @@ def draw_score_panel(
         ),
         fill=WHITE
     )
-
-    # ========================================================
-    # WINNER
-    # ========================================================
 
     if result["winner"] == player_index:
 
@@ -1956,10 +2127,6 @@ def draw_score_panel(
             YELLOW
         )
 
-    # ========================================================
-    # SCORE BARS
-    # ========================================================
-
     label_x = panel_left + 38
 
     bar_x = 300
@@ -1989,10 +2156,6 @@ def draw_score_panel(
             "players"
         ][player_index][key]
 
-        # ----------------------------------------------------
-        # LABEL
-        # ----------------------------------------------------
-
         draw.text(
             (
                 label_x,
@@ -2005,10 +2168,6 @@ def draw_score_panel(
             ),
             fill=MUTED
         )
-
-        # ----------------------------------------------------
-        # BAR BACKGROUND
-        # ----------------------------------------------------
 
         bar_y = row_y + 4
         bar_h = 26
@@ -2023,10 +2182,6 @@ def draw_score_panel(
             radius=13,
             fill=BAR_BG
         )
-
-        # ----------------------------------------------------
-        # BAR FILL
-        # ----------------------------------------------------
 
         fill_w = (
             bar_width
@@ -2048,10 +2203,6 @@ def draw_score_panel(
                 radius=13,
                 fill=YELLOW
             )
-
-        # ----------------------------------------------------
-        # NUMBER
-        # ----------------------------------------------------
 
         draw.text(
             (
@@ -2081,8 +2232,6 @@ def draw_vs(
 
     line_y = y + 58
 
-    # Left line
-
     draw.line(
         (
             70,
@@ -2094,8 +2243,6 @@ def draw_vs(
         width=3
     )
 
-    # Right line
-
     draw.line(
         (
             center_x + 115,
@@ -2106,8 +2253,6 @@ def draw_vs(
         fill=BORDER,
         width=3
     )
-
-    # Black VS block
 
     draw.rounded_rectangle(
         (
@@ -2220,10 +2365,6 @@ def create_card(
 
     center_x = W // 2
 
-    # ========================================================
-    # HEADER
-    # ========================================================
-
     draw_center(
         draw,
         "MOG BATTLE",
@@ -2248,10 +2389,6 @@ def create_card(
         MUTED
     )
 
-    # ========================================================
-    # PLAYER 1
-    # ========================================================
-
     player1_profile_y = 150
 
     draw_profile_header(
@@ -2272,20 +2409,12 @@ def create_card(
         player1_score_y
     )
 
-    # ========================================================
-    # VS
-    # ========================================================
-
     vs_y = 1280
 
     draw_vs(
         draw,
         vs_y
     )
-
-    # ========================================================
-    # PLAYER 2
-    # ========================================================
 
     player2_profile_y = 1415
 
@@ -2307,10 +2436,6 @@ def create_card(
         player2_score_y
     )
 
-    # ========================================================
-    # MOGGED
-    # ========================================================
-
     if result["loser"] is not None:
 
         stamp = create_mogged_stamp()
@@ -2321,7 +2446,6 @@ def create_card(
             stamp.width // 2
         )
 
-        # Stamp over the lower score section.
         stamp_y = 2145
 
         image.paste(
@@ -2332,10 +2456,6 @@ def create_card(
             ),
             stamp
         )
-
-    # ========================================================
-    # RESULT AREA
-    # ========================================================
 
     result_y = 2400
 
@@ -2350,8 +2470,6 @@ def create_card(
         width=3
     )
 
-    # Status
-
     draw.text(
         (
             70,
@@ -2364,8 +2482,6 @@ def create_card(
         ),
         fill=RED
     )
-
-    # Winner
 
     if result["winner"] is None:
 
@@ -2390,8 +2506,6 @@ def create_card(
         ),
         YELLOW
     )
-
-    # Difference
 
     difference_label = "Разрыв"
 
@@ -2420,8 +2534,6 @@ def create_card(
         ),
         fill=YELLOW
     )
-
-    # Verdict
 
     verdict = (
         str(
@@ -2470,10 +2582,6 @@ def create_card(
 
         verdict_y += 34
 
-    # ========================================================
-    # FOOTER
-    # ========================================================
-
     draw_center(
         draw,
         "MOG AI  •  POWERED BY GEMINI",
@@ -2485,10 +2593,6 @@ def create_card(
         ),
         MUTED
     )
-
-    # ========================================================
-    # EXPORT
-    # ========================================================
 
     output = io.BytesIO()
 
@@ -2543,10 +2647,6 @@ async def resolve_target(
     bot: Bot
 ):
 
-    # ========================================================
-    # REPLY
-    # ========================================================
-
     if (
         message.reply_to_message
         and
@@ -2557,10 +2657,6 @@ async def resolve_target(
             message.from_user.id,
             message.reply_to_message.from_user.id
         )
-
-    # ========================================================
-    # USERNAME
-    # ========================================================
 
     text = message.text or ""
 
@@ -3282,4 +3378,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         main()
-        )
+    )
